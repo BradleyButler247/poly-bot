@@ -112,7 +112,6 @@ async def _fetch_wallet_balance(wallet_address: str) -> Optional[float]:
 
 @app.get("/api/summary")
 async def summary():
-    """Top-level account stats."""
     resolved = _load_resolved_trades()
     open_trades = _load_open_trades()
 
@@ -120,10 +119,13 @@ async def summary():
     total_wagered = sum(t.get("usdc_size", 0) for t in resolved)
     wins = sum(1 for t in resolved if t.get("won"))
     total = len(resolved)
-
-    # Unrealised P&L on open positions (uses last known price from open_trades)
-    unrealised = 0.0
     open_volume = sum(t.get("usdc_size", 0) for t in open_trades)
+
+    # Fetch live wallet balance
+    wallet_address = os.getenv("WALLET_ADDRESS", "")
+    balance = None
+    if wallet_address:
+        balance = await _fetch_wallet_balance(wallet_address)
 
     return {
         "total_pnl_usd": round(total_pnl, 2),
@@ -134,6 +136,7 @@ async def summary():
         "open_positions_count": len(open_trades),
         "open_volume_usd": round(open_volume, 2),
         "realised_pnl_usd": round(total_pnl, 2),
+        "wallet_balance_usd": round(balance, 2) if balance is not None else None,
     }
 
 

@@ -635,7 +635,7 @@ function renderSummary(s, open) {
   $('s-pnl').className = 'stat-value ' + (totalPnl >= 0 ? 'up' : 'down');
   $('s-pnl-pct').textContent = pct(s.total_pnl_pct ?? 0);
 
-  $('s-balance').textContent = '—'; // filled by optional wallet endpoint
+  $('s-balance').textContent = s.wallet_balance_usd != null ? usd(s.wallet_balance_usd) : '—';
   $('s-volume').textContent = usd(s.total_volume_usd ?? 0);
   $('s-trades').textContent = (s.total_trades ?? 0) + ' trades';
   $('s-winrate').textContent = (s.win_rate_pct ?? 0).toFixed(1) + '%';

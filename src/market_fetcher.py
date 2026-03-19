@@ -93,6 +93,14 @@ class MarketFetcher:
             if not any(cat.lower() in tags for cat in self.config.market_categories):
                 return False, "category"
 
+        # Skip near-resolved markets (price > 0.95 or < 0.05 on either side)
+        tokens = market.get("tokens") or []
+        for token in tokens:
+            if str(token.get("outcome", "")).upper() == "YES":
+                price = float(token.get("price") or 0.5)
+                if price > 0.95 or price < 0.05:
+                    return False, "liquidity"  # reuse liquidity bucket for near-resolved
+
         return True, "ok"
 
     async def get_market_orderbook(self, token_id: str) -> dict[str, Any]:
