@@ -27,10 +27,14 @@ CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 
 app = FastAPI(title="Polymarket Bot API")
 
+import os
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
@@ -240,6 +244,13 @@ async def health_simple():
     return {"status": "ok"}
 
 
-# Serve the frontend dashboard SPA
+# Serve the built-in dashboard at /dashboard
+# IMPORTANT: API routes above take priority because they are registered first.
+# Mounting at "/" catches everything including /api/* which breaks the Lovable frontend.
 if os.path.exists("dashboard"):
-    app.mount("/", StaticFiles(directory="dashboard", html=True), name="static")
+    app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="static")
+
+@app.get("/")
+async def root():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/dashboard/index.html")
