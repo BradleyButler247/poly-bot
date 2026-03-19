@@ -4,9 +4,12 @@ Polymarket AI Trading Bot — main orchestration loop
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from datetime import datetime
+
+os.makedirs("logs", exist_ok=True)
 
 from .config import Config
 from .market_fetcher import MarketFetcher
