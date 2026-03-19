@@ -22,72 +22,36 @@ from .audit_log import AuditLog
 
 log = logging.getLogger("ai_analyst")
 
-BASE_SYSTEM_PROMPT = """You are an expert prediction market trader. Your single goal is to maximise
-long-run profit (expected value) on Polymarket binary markets.
+BASE_SYSTEM_PROMPT = """You are a prediction market trader. Maximise long-run profit on Polymarket binary markets.
 
-A binary market resolves YES or NO. Prices are implied probabilities (0–1).
-If YES trades at 0.30 but your best estimate is 0.45, you have +15pp edge — buy YES.
-If YES trades at 0.72 but you think true probability is 0.55, you have +17pp edge — buy NO.
+Prices are implied probabilities (0-1). Edge = |your_prob - market_price|.
 
-## Decision framework
-1. Understand exactly what resolves the market (read description carefully).
-2. Weigh the web search evidence. Prioritise recency and source quality.
-3. Apply a base rate / reference class (e.g. "polls miss by avg X pts", "incumbents win Y% of time").
-4. Form your probability estimate. Be honest about uncertainty — widen intervals, don't fake precision.
-5. Compute edge = |your_prob - market_price|. Compute EV = edge * (1/market_price - 1) roughly.
-6. Decide whether to trade and how much. Size proportional to edge and confidence.
-   - High confidence + large edge → larger fraction of max allowed size
-   - Low confidence or small edge → smaller size or skip
-   - Never bet just because edge is marginally positive if confidence is low
-7. Tag the trade with strategy categories (see below) so the learning loop can track them.
+Process:
+1. What exactly resolves this market?
+2. What do the news snippets tell you?
+3. What base rate applies?
+4. Your probability estimate for YES.
+5. Edge and EV. Size proportional to confidence × edge.
 
-## Strategy tags (pick 1–3 that best describe why you're trading this market)
-- "news_momentum"     — strong directional news flow clearly not priced in
-- "mean_reversion"    — market has overreacted, fundamentals unchanged
-- "base_rate"         — market ignoring well-established historical rate
-- "expert_consensus"  — clear expert/institutional consensus vs market
-- "late_mover"        — closing soon, resolution nearly certain
-- "thin_market"       — low liquidity creates mispricing opportunity
-- "sentiment_gap"     — social/media sentiment divorced from fundamentals
-- "arbitrage"         — related markets imply inconsistency
+Strategy tags (pick 1-2):
+news_momentum, mean_reversion, base_rate, expert_consensus, late_mover, thin_market, sentiment_gap, arbitrage
 
-## Output format
-Return ONLY valid JSON, no markdown fences:
+Output ONLY valid JSON:
 {
-  "should_trade": true | false,
-  "reasoning": "string — your full chain of reasoning, 3–6 sentences",
-  "your_probability": 0.0–1.0,
-  "market_price": 0.0–1.0,
-  "edge": 0.0–1.0,
-  "ev_score": -1.0–1.0,
-  "trade": {
-    "outcome": "YES" | "NO",
-    "price": 0.0–1.0,
-    "size_fraction": 0.0–1.0,
-    "usdc_size": 0.0
-  },
-  "confidence": "low" | "medium" | "high",
-  "strategy_tags": ["tag1", "tag2"]
+  "should_trade": true|false,
+  "reasoning": "2-3 sentences max",
+  "your_probability": 0.0-1.0,
+  "market_price": 0.0-1.0,
+  "edge": 0.0-1.0,
+  "ev_score": -1.0-1.0,
+  "trade": {"outcome": "YES"|"NO", "price": 0.0-1.0, "size_fraction": 0.0-1.0, "usdc_size": 0.0},
+  "confidence": "low"|"medium"|"high",
+  "strategy_tags": ["tag"]
 }
-trade field is required only when should_trade is true.
-size_fraction is 0–1 representing fraction of max allowed trade size to use."""
+trade only required when should_trade is true."""
 
 
-STRATEGY_CRITIQUE_PROMPT = """You are reviewing the recent performance of a Polymarket trading bot
-that you also operate. Your job is to update the trading strategy based on what's working and what isn't.
-
-Review the resolved trades and performance stats provided. Then write concise, actionable strategy notes
-(3–8 bullet points) that should guide future trading decisions. Focus on:
-- Which market categories / strategy tags are profitable vs losing
-- Systematic biases (e.g. overconfident on political markets, underestimating late-mover edge)
-- Calibration issues (are your probability estimates consistently too high or too low?)
-- Sizing mistakes (betting too much on low-confidence trades?)
-- Any patterns in winning vs losing trades
-
-Be specific and self-critical. These notes will be injected into your system prompt for every
-future analysis, so they must be actionable.
-
-Return ONLY the bullet points as a plain string, no JSON."""
+STRATEGY_CRITIQUE_PROMPT = """Review this Polymarket bot's performance and write 3-5 bullet points of actionable strategy notes. Be specific about what's working and what isn't. Plain text only, no JSON."""
 
 
 class AIAnalyst:
@@ -202,39 +166,26 @@ Total resolved trades: {stats['total']} | Win rate: {stats.get('win_rate',0)*100
         question = market["question"]
         liquidity = float(market.get("liquidity") or 0)
         end_date = market.get("endDate") or market.get("end_date_iso") or "Unknown"
-        description = market.get("description") or ""
-        search_text = "\n".join(f"- {s}" for s in snippets) if snippets else "No results found."
+        description = (market.get("description") or "")[:200]
+        search_text = "\n".join(f"- {s[:120]}" for s in snippets[:4]) if snippets else "No results."
 
-        return f"""MARKET: {question}
-
-DESCRIPTION: {description or "N/A"}
-
-YES PRICE: {yes_price:.4f}  (implied prob: {yes_price*100:.1f}%)
-NO PRICE:  {1-yes_price:.4f}  (implied prob: {(1-yes_price)*100:.1f}%)
-LIQUIDITY: ${liquidity:,.0f} USDC
-RESOLVES:  {end_date}
-MAX TRADE: ${self.config.max_trade_usdc:.2f} USDC
-
-RECENT WEB SEARCH RESULTS:
+        return f"""Market: {question}
+Desc: {description}
+YES: {yes_price:.3f} | NO: {1-yes_price:.3f} | Liq: ${liquidity:,.0f} | Resolves: {end_date}
+Max: ${self.config.max_trade_usdc:.0f}
+News:
 {search_text}
-
-Analyse this market and return your JSON trade decision.
-Use size_fraction (0–1) to express how much of the ${self.config.max_trade_usdc:.2f} max you want to use.
-Maximise expected value — do not apply any arbitrary minimum edge threshold."""
+Return JSON."""
 
     async def _search_context(self, question: str) -> list[str]:
         try:
             search_response = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=1024,
+                max_tokens=400,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{
                     "role": "user",
-                    "content": (
-                        f'Search for recent news and data relevant to this prediction market: '
-                        f'"{question}". Summarise 4–6 key facts that help estimate the probability. '
-                        f"Focus on the most recent developments and any data points (polls, odds, statistics)."
-                    ),
+                    "content": f'Find 3 key recent facts relevant to: "{question}". Be brief.'
                 }],
             )
             snippets = []
