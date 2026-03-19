@@ -24,7 +24,7 @@ class Config:
     max_trade_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_TRADE_USDC", "20")))
     max_daily_loss_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_USDC", "100")))
     max_position_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_USDC", "50")))
-    min_liquidity_usdc: float = field(default_factory=lambda: float(os.getenv("MIN_LIQUIDITY_USDC", "5000")))
+    min_liquidity_usdc: float = field(default_factory=lambda: float(os.getenv("MIN_LIQUIDITY_USDC", "1000")))
 
     # ── Bot behaviour ──────────────────────────────────────────────────────
     cycle_interval_seconds: int = field(default_factory=lambda: int(os.getenv("CYCLE_INTERVAL_SECONDS", "300")))

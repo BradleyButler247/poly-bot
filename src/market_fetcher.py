@@ -17,14 +17,20 @@ class MarketFetcher:
         self.config = config
 
     async def get_candidate_markets(self) -> list[dict]:
-        """
-        Fetch active markets, apply pre-filters, return the best candidates.
-        """
         markets = await self._fetch_active_markets()
-        candidates = [m for m in markets if self._passes_prefilter(m)]
+        log.info(f"Fetched {len(markets)} raw markets from Gamma API")
 
-        # Sort by liquidity descending, take top N
-        candidates.sort(key=lambda m: float(m.get("liquidity", 0)), reverse=True)
+        candidates = []
+        filter_counts = {"liquidity": 0, "outcomes": 0, "expired": 0, "category": 0}
+        for m in markets:
+            passed, reason = self._passes_prefilter(m)
+            if passed:
+                candidates.append(m)
+            else:
+                filter_counts[reason] = filter_counts.get(reason, 0) + 1
+
+        log.info(f"Pre-filter results: {len(candidates)} passed, filtered out → {filter_counts}")
+        candidates.sort(key=lambda m: float(m.get("liquidity") or 0), reverse=True)
         return candidates[: self.config.max_markets_per_cycle]
 
     async def _fetch_active_markets(self) -> list[dict]:
@@ -36,52 +42,58 @@ class MarketFetcher:
             "ascending": "false",
         }
         if self.config.market_categories:
-            params["tag"] = self.config.market_categories[0]  # Gamma supports one tag filter
+            params["tag"] = self.config.market_categories[0]
 
         url = f"{self.config.gamma_host}/markets"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            if isinstance(data, list):
+                return data
+            return data.get("markets", [])
+        except Exception as e:
+            log.error(f"Failed to fetch markets from Gamma API: {e}")
+            return []
 
-        # Gamma returns a list directly or wrapped in {"markets": [...]}
-        if isinstance(data, list):
-            return data
-        return data.get("markets", [])
+    def _passes_prefilter(self, market: dict) -> tuple[bool, str]:
+        import datetime
+        import json as _json
 
-    def _passes_prefilter(self, market: dict) -> bool:
-        """Quick rule-based filters before spending API calls on AI analysis."""
-
-        # Must have enough liquidity
+        # Liquidity check
         liquidity = float(market.get("liquidity") or 0)
         if liquidity < self.config.min_liquidity_usdc:
-            return False
+            return False, "liquidity"
 
-        # Must be binary (YES/NO) — easier to price
-        outcomes = market.get("outcomes", [])
-        if len(outcomes) != 2:
-            return False
+        # Binary market check — outcomes field can be a JSON string or a list
+        outcomes_raw = market.get("outcomes", [])
+        if isinstance(outcomes_raw, str):
+            try:
+                outcomes_raw = _json.loads(outcomes_raw)
+            except Exception:
+                outcomes_raw = []
+        if len(outcomes_raw) != 2:
+            return False, "outcomes"
 
-        # Skip markets resolving in < 1 hour (too close to resolution)
-        import datetime
+        # Skip markets resolving in < 1 hour
         end_date = market.get("endDate") or market.get("end_date_iso")
         if end_date:
             try:
                 closes = datetime.datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                 now = datetime.datetime.now(datetime.timezone.utc)
-                hours_left = (closes - now).total_seconds() / 3600
-                if hours_left < 1:
-                    return False
+                if (closes - now).total_seconds() / 3600 < 1:
+                    return False, "expired"
             except Exception:
                 pass
 
-        # Category filter (if set)
+        # Category filter
         if self.config.market_categories:
             tags = [t.lower() for t in (market.get("tags") or [])]
             if not any(cat.lower() in tags for cat in self.config.market_categories):
-                return False
+                return False, "category"
 
-        return True
+        return True, "ok"
 
     async def get_market_orderbook(self, token_id: str) -> dict[str, Any]:
         """Fetch the live order book for a specific outcome token."""

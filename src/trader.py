@@ -27,15 +27,30 @@ class Trader:
         self._client = self._build_client()
 
     def _build_client(self) -> ClobClient:
-        """Initialise the Polymarket CLOB client with your credentials."""
+        """
+        Initialise the Polymarket CLOB client.
+
+        Polymarket embedded wallets use signature_type=0 (EOA).
+        We pass the API key/secret/passphrase directly from env vars
+        rather than trying to derive them (which caused the 400 error).
+        """
+        from py_clob_client.clob_types import ApiCreds
+
         client = ClobClient(
             host=self.config.clob_host,
             chain_id=POLYGON,
             key=self.config.wallet_private_key,
-            signature_type=2,  # POLY_GNOSIS_SAFE — standard for API trading
+            signature_type=0,  # EOA — correct for Polymarket embedded wallets
             funder=self.config.wallet_private_key,
         )
-        client.set_api_creds(client.create_or_derive_api_creds())
+
+        # Use the API credentials you generated on polymarket.com directly
+        creds = ApiCreds(
+            api_key=self.config.poly_api_key,
+            api_secret=self.config.poly_api_secret,
+            api_passphrase=self.config.poly_api_passphrase,
+        )
+        client.set_api_creds(creds)
         log.info("CLOB client initialised")
         return client
 
