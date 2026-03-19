@@ -86,26 +86,32 @@ async def _fetch_current_price(market_id: str) -> Optional[float]:
 
 
 async def _fetch_wallet_balance(wallet_address: str) -> Optional[float]:
-    """Fetch USDC balance on Polygon for this wallet via public RPC."""
-    # USDC contract on Polygon
-    USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    """Fetch USDC balance on Polygon. Tries both native USDC and bridged USDC.e."""
+    # Both contract addresses used on Polygon
+    contracts = [
+        ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),   # Native USDC (Circle)
+        ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),   # USDC.e (bridged) — Polymarket uses this
+    ]
     RPC = "https://polygon-rpc.com"
-    # balanceOf(address) selector
-    data = "0x70a08231" + wallet_address.replace("0x", "").lower().zfill(64)
-    payload = {
-        "jsonrpc": "2.0", "method": "eth_call",
-        "params": [{"to": USDC, "data": data}, "latest"],
-        "id": 1,
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(RPC, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                result = await resp.json()
-        hex_val = result.get("result", "0x0")
-        raw = int(hex_val, 16)
-        return raw / 1e6  # USDC has 6 decimals
-    except Exception:
-        return None
+    total = 0.0
+    addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
+    for contract, decimals in contracts:
+        data = "0x70a08231" + addr_padded
+        payload = {
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{"to": contract, "data": data}, "latest"],
+            "id": 1,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(RPC, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    result = await resp.json()
+            hex_val = result.get("result", "0x0")
+            raw = int(hex_val, 16)
+            total += raw / (10 ** decimals)
+        except Exception:
+            pass
+    return total
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -236,6 +242,19 @@ async def pnl_curve():
 
     return points
 
+
+@app.get("/api/debug")
+async def debug():
+    import os
+    return {
+        "audit_exists": os.path.exists(AUDIT_LOG_PATH),
+        "open_trades_exists": os.path.exists(OPEN_TRADES_PATH),
+        "resolved_exists": os.path.exists(RESOLVED_LOG_PATH),
+        "audit_lines": sum(1 for _ in open(AUDIT_LOG_PATH)) if os.path.exists(AUDIT_LOG_PATH) else 0,
+        "open_trades_lines": sum(1 for _ in open(OPEN_TRADES_PATH)) if os.path.exists(OPEN_TRADES_PATH) else 0,
+        "wallet_address": os.getenv("WALLET_ADDRESS", "not set"),
+        "logs_dir": os.listdir("logs") if os.path.exists("logs") else "missing",
+    }
 
 @app.get("/api/health")
 async def health():
