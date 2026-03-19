@@ -234,6 +234,11 @@ async def pnl_curve():
 async def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
+@app.get("/health")
+async def health_simple():
+    """Short path for Railway health checks."""
+    return {"status": "ok"}
+
 
 # Serve the frontend dashboard SPA
 if os.path.exists("dashboard"):
