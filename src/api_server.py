@@ -1,8 +1,6 @@
 """
 API Server — lightweight FastAPI server that runs alongside the bot
 and exposes trading data as JSON endpoints for the frontend dashboard.
-
-Runs in a separate thread so it doesn't block the async bot loop.
 """
 
 import json
@@ -12,10 +10,10 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 
 log = logging.getLogger("api")
 
@@ -25,11 +23,9 @@ OPEN_TRADES_PATH = os.getenv("OPEN_TRADES_PATH", "logs/open_trades.jsonl")
 GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 
-app = FastAPI(title="Polymarket Bot API")
-
-import os
-
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
+app = FastAPI(title="Polymarket Bot API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,8 +34,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ── Data loaders ─────────────────────────────────────────────────────────────
 
 def _load_jsonl(path: str) -> list[dict]:
     records = []
@@ -66,7 +60,6 @@ def _load_resolved_trades() -> list[dict]:
 
 
 async def _fetch_current_price(market_id: str) -> Optional[float]:
-    """Fetch the current YES price for an open position."""
     try:
         url = f"{GAMMA_HOST}/markets/{market_id}"
         async with aiohttp.ClientSession() as session:
@@ -85,15 +78,52 @@ async def _fetch_current_price(market_id: str) -> Optional[float]:
     return None
 
 
-async def _fetch_wallet_balance(wallet_address: str) -> Optional[float]:
+async def _fetch_wallet_balance() -> Optional[float]:
     """
-    Fetch USDC.e balance from Polymarket CLOB API.
-    Per docs: GET /balance-allowance with signature_type=1 (POLY_PROXY)
-    and the proxy wallet address as poly-address header.
-    Falls back to direct Polygon RPC call against USDC.e contract
-    (0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174) per contract addresses docs.
+    Fetch USDC.e balance directly from Polygon blockchain.
+    Uses the proxy wallet address (WALLET_ADDRESS env var).
+    USDC.e contract per official Polymarket docs: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
     """
-    # Primary: Polymarket CLOB balance endpoint
+    wallet_address = os.getenv("WALLET_ADDRESS", "")
+    if not wallet_address:
+        return None
+
+    # Direct Polygon RPC call — no auth needed, just reads the blockchain
+    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    RPC_ENDPOINTS = [
+        "https://polygon-rpc.com",
+        "https://rpc-mainnet.matic.network",
+        "https://rpc.ankr.com/polygon",
+    ]
+
+    addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
+    data = "0x70a08231" + addr_padded  # balanceOf(address)
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": USDC_E, "data": data}, "latest"],
+        "id": 1,
+    }
+
+    for rpc in RPC_ENDPOINTS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(rpc, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    result = await resp.json()
+            hex_val = result.get("result", "0x0")
+            if hex_val and hex_val != "0x":
+                raw = int(hex_val, 16)
+                balance = raw / 1e6  # USDC.e has 6 decimals
+                if balance > 0:
+                    log.info(f"Balance fetched from {rpc}: ${balance:.2f}")
+                    return balance
+        except Exception as e:
+            log.debug(f"RPC {rpc} failed: {e}")
+            continue
+
+    # If all RPCs return 0 or fail, try fetching from Polymarket's CLOB
+    # The CLOB balance endpoint reflects trading balance not on-chain balance
     try:
         url = f"{CLOB_HOST}/balance-allowance"
         params = {"asset_type": "USDC", "signature_type": 1}
@@ -103,32 +133,14 @@ async def _fetch_wallet_balance(wallet_address: str) -> Optional[float]:
                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    log.debug(f"Balance response: {data}")
+                    log.debug(f"CLOB balance response: {data}")
                     balance = float(data.get("balance", 0) or 0)
-                    return balance / 1e6  # USDC.e has 6 decimals
+                    return balance / 1e6
     except Exception as e:
         log.warning(f"CLOB balance fetch failed: {e}")
 
-    # Fallback: direct Polygon RPC call against USDC.e contract
-    # Per docs contract address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    RPC = "https://polygon-rpc.com"
-    addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
-    data = "0x70a08231" + addr_padded
-    payload = {"jsonrpc": "2.0", "method": "eth_call",
-               "params": [{"to": USDC_E, "data": data}, "latest"], "id": 1}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(RPC, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                result = await resp.json()
-        return int(result.get("result", "0x0"), 16) / 1e6
-    except Exception as e:
-        log.warning(f"RPC balance fetch failed: {e}")
-        return None
+    return None
 
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/summary")
 async def summary():
@@ -141,11 +153,7 @@ async def summary():
     total = len(resolved)
     open_volume = sum(t.get("usdc_size", 0) for t in open_trades)
 
-    # Fetch live USDC.e balance from proxy wallet (profile address per docs)
-    wallet_address = os.getenv("WALLET_ADDRESS", "")  # must be proxy address 0x1ed8...
-    balance = None
-    if wallet_address:
-        balance = await _fetch_wallet_balance(wallet_address)
+    balance = await _fetch_wallet_balance()
 
     return {
         "total_pnl_usd": round(total_pnl, 2),
@@ -162,7 +170,6 @@ async def summary():
 
 @app.get("/api/positions/open")
 async def open_positions():
-    """Current open positions with live unrealised P&L."""
     trades = _load_open_trades()
     result = []
 
@@ -172,10 +179,9 @@ async def open_positions():
         usdc_size = float(t.get("usdc_size", 0))
         shares = usdc_size / price_paid if price_paid > 0 else 0
 
-        # Try to get current market price
         current_price = await _fetch_current_price(t.get("market_id", ""))
         if current_price is None:
-            current_price = price_paid  # fallback: no change
+            current_price = price_paid
 
         if outcome == "NO":
             current_price = 1.0 - current_price
@@ -206,7 +212,6 @@ async def open_positions():
 
 @app.get("/api/positions/history")
 async def trade_history(limit: int = 100):
-    """Resolved trade history."""
     trades = _load_resolved_trades()
     trades.sort(key=lambda t: t.get("ts") or "", reverse=True)
     trades = trades[:limit]
@@ -228,7 +233,7 @@ async def trade_history(limit: int = 100):
             "won": t.get("won"),
             "market_resolved_yes": t.get("market_resolved_yes"),
             "date_opened": t.get("ts"),
-            "date_closed": t.get("ts"),  # resolved timestamp
+            "date_closed": t.get("ts"),
             "strategy_tags": t.get("strategy_tags", []),
             "your_probability": t.get("your_probability"),
         })
@@ -238,7 +243,6 @@ async def trade_history(limit: int = 100):
 
 @app.get("/api/pnl/curve")
 async def pnl_curve():
-    """Cumulative P&L over time for the chart."""
     trades = _load_resolved_trades()
     trades.sort(key=lambda t: t.get("ts") or "")
 
@@ -259,13 +263,13 @@ async def pnl_curve():
 
 @app.get("/api/audit")
 async def audit_log(limit: int = 20):
-    """Return raw audit log entries for debugging."""
     records = _load_jsonl(AUDIT_LOG_PATH)
     return records[-limit:]
 
+
 @app.get("/api/debug")
 async def debug():
-    import os
+    balance = await _fetch_wallet_balance()
     return {
         "audit_exists": os.path.exists(AUDIT_LOG_PATH),
         "open_trades_exists": os.path.exists(OPEN_TRADES_PATH),
@@ -273,26 +277,25 @@ async def debug():
         "audit_lines": sum(1 for _ in open(AUDIT_LOG_PATH)) if os.path.exists(AUDIT_LOG_PATH) else 0,
         "open_trades_lines": sum(1 for _ in open(OPEN_TRADES_PATH)) if os.path.exists(OPEN_TRADES_PATH) else 0,
         "wallet_address": os.getenv("WALLET_ADDRESS", "not set"),
+        "wallet_balance_usd": round(balance, 2) if balance is not None else None,
         "logs_dir": os.listdir("logs") if os.path.exists("logs") else "missing",
     }
+
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
+
 @app.get("/health")
 async def health_simple():
-    """Short path for Railway health checks."""
     return {"status": "ok"}
 
 
-# Serve the built-in dashboard at /dashboard
-# IMPORTANT: API routes above take priority because they are registered first.
-# Mounting at "/" catches everything including /api/* which breaks the Lovable frontend.
 if os.path.exists("dashboard"):
     app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="static")
 
+
 @app.get("/")
 async def root():
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/dashboard/index.html")
