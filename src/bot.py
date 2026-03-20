@@ -1,11 +1,11 @@
 """
 Polymarket AI Trading Bot — main orchestration loop
 
-Speed strategy:
-- All markets analysed in parallel using asyncio.gather
-- Tier 2 API: 450k tokens/min — 20 markets simultaneously is well within budget
-- Balance fetched once per cycle and tracked optimistically across parallel trades
-- Orders serialised 3 at a time to avoid CLOB race conditions
+- Markets analysed in parallel (Tier 2: 450k tokens/min)
+- Balance fetched once per cycle, passed into analyst for relative sizing
+- Double-position prevention: skip markets we already hold
+- Orders serialised to avoid CLOB race conditions
+- Balance tracked optimistically across concurrent trades
 """
 
 import asyncio
@@ -60,6 +60,7 @@ class PolymarketBot:
         self._analysis_sem = None
         self._order_sem = None
         self._balance_lock = None
+        self._available_balance = None
 
     async def run(self):
         log.info("=== Polymarket AI Bot starting ===")
@@ -96,31 +97,39 @@ class PolymarketBot:
             log.warning("Daily loss limit hit — skipping")
             return
 
-        # Fetch markets, check resolutions, update strategy — all at once
+        # Run all setup tasks concurrently
         results = await asyncio.gather(
             self.fetcher.get_candidate_markets(),
             self.resolver.check_resolutions(),
             self.analyst.maybe_update_strategy(),
+            self.trader.fetch_balance(),
             return_exceptions=True,
         )
-        markets = results[0] if not isinstance(results[0], Exception) else []
 
-        # Fetch live wallet balance — cap trades to what we actually have
-        self._available_balance = await self.trader.fetch_balance()
+        markets = results[0] if not isinstance(results[0], Exception) else []
+        self._available_balance = results[3] if not isinstance(results[3], Exception) else None
+
         if self._available_balance is not None:
-            log.info(f"Available balance: ${self._available_balance:.2f} USDC")
+            log.info(f"Balance: ${self._available_balance:.2f} USDC")
         else:
-            log.warning("Could not fetch balance — using config MAX_TRADE_USDC as cap")
+            log.warning("Balance fetch failed — trades capped at MAX_TRADE_USDC")
 
         if not markets:
             log.warning("No candidate markets this cycle")
             return
 
-        log.info(f"Evaluating {len(markets)} markets in parallel")
-        await _notify("cycle_start", {"cycle_id": cycle_id, "market_count": len(markets)})
+        # Load open positions once — used for double-position prevention
+        open_market_ids = self.resolver.get_open_market_ids()
+        if open_market_ids:
+            log.info(f"Skipping {sum(1 for m in markets if m['id'] in open_market_ids)} already-held markets")
 
-        # Analyse all markets simultaneously — Tier 2 handles the throughput
-        tasks = [self._evaluate_market(market, cycle_id) for market in markets]
+        # Filter out markets we already hold before analysis (saves API calls)
+        markets_to_analyse = [m for m in markets if m["id"] not in open_market_ids]
+
+        log.info(f"Evaluating {len(markets_to_analyse)} markets in parallel")
+        await _notify("cycle_start", {"cycle_id": cycle_id, "market_count": len(markets_to_analyse)})
+
+        tasks = [self._evaluate_market(market, cycle_id) for market in markets_to_analyse]
         await asyncio.gather(*tasks, return_exceptions=True)
 
         await _notify("cycle_end", {"cycle_id": cycle_id})
@@ -132,7 +141,8 @@ class PolymarketBot:
         try:
             async with self._analysis_sem:
                 log.info(f"  Analysing: {question[:70]}")
-                analysis = await self.analyst.analyse(market)
+                # Pass live balance into analyst — sizing is relative to wallet
+                analysis = await self.analyst.analyse(market, balance=self._available_balance)
         except Exception as e:
             log.error(f"Analysis failed for {market_id}: {e}")
             return
@@ -146,24 +156,36 @@ class PolymarketBot:
         trade = analysis["trade"]
         trade["market_id"] = market_id
 
-        # Cap trade size to available balance under a lock (parallel trades share balance)
+        # Balance gate — under lock so parallel tasks don't over-commit
         async with self._balance_lock:
             balance = self._available_balance
+            usdc_size = float(trade.get("usdc_size", self.config.max_trade_usdc))
+
             if balance is not None:
-                usdc_size = float(trade.get("usdc_size", self.config.max_trade_usdc))
-                # Never spend more than 80% of remaining balance on a single trade
-                max_allowed = min(self.config.max_trade_usdc, balance * 0.8)
-                if max_allowed < 1.0:
-                    log.info(f"    → Skip (insufficient balance: ${balance:.2f} USDC)")
+                # Hard floor: need at least min_trade_usdc available
+                if balance < self.config.min_trade_usdc:
+                    log.info(f"    → Skip (insufficient balance: ${balance:.2f})")
                     return
-                trade["usdc_size"] = round(min(usdc_size, max_allowed), 2)
-                # Deduct optimistically so concurrent trades don't over-commit
+                # Cap to what's actually available
+                usdc_size = min(usdc_size, balance)
+
+            # Final cap from config
+            usdc_size = min(usdc_size, self.config.max_trade_usdc)
+            usdc_size = max(usdc_size, self.config.min_trade_usdc)
+            trade["usdc_size"] = round(usdc_size, 2)
+
+            # Deduct optimistically so concurrent trades don't over-commit
+            if balance is not None:
                 self._available_balance = balance - trade["usdc_size"]
 
         allowed, reason = self.risk.approve_trade(trade)
         if not allowed:
             log.info(f"    → Risk block: {reason}")
             self.audit.log_risk_block(cycle_id, market_id, trade, reason)
+            # Return balance on risk block
+            async with self._balance_lock:
+                if self._available_balance is not None:
+                    self._available_balance += trade["usdc_size"]
             return
 
         log.info(
@@ -172,15 +194,14 @@ class PolymarketBot:
             f"conf={analysis.get('confidence')} tags={analysis.get('strategy_tags',[])} "
         )
 
-        # Serialise order placement — avoid hammering CLOB simultaneously
         async with self._order_sem:
             result = await self.trader.place_order(market, trade)
 
-        # If order failed, return the balance
+        # Return balance if order failed
         if not result.get("success"):
             async with self._balance_lock:
                 if self._available_balance is not None:
-                    self._available_balance += trade.get("usdc_size", 0)
+                    self._available_balance += trade["usdc_size"]
 
         self.audit.log_trade(cycle_id, market_id, question, trade, result, analysis)
 

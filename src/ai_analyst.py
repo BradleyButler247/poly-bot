@@ -39,7 +39,7 @@ Output ONLY valid JSON:
   "confidence": "low"|"medium"|"high",
   "strategy_tags": ["tag"]
 }
-size_fraction is 0-1 relative to your max allowed trade size.
+size_fraction is 0-1 where 1.0 = your maximum allowed trade size shown in the prompt.
 trade only required when should_trade is true."""
 
 
@@ -92,9 +92,6 @@ class AIAnalyst:
 
         log.info("Running strategy self-critique...")
         try:
-            recent = stats.get("recent_10", [])
-            tag_stats = stats.get("tag_stats", {})
-
             critique_prompt = f"""PERFORMANCE SUMMARY:
 Total trades: {stats['total']}
 Win rate: {stats.get('win_rate', 0)*100:.1f}%
@@ -102,10 +99,10 @@ Total P&L: ${stats.get('total_pnl', 0):.2f}
 ROI: {stats.get('roi_pct', 0):.1f}%
 
 STRATEGY TAG BREAKDOWN:
-{json.dumps(tag_stats, indent=2)}
+{json.dumps(stats.get('tag_stats', {}), indent=2)}
 
 MOST RECENT 10 RESOLVED TRADES:
-{json.dumps(recent, indent=2)}
+{json.dumps(stats.get('recent_10', []), indent=2)}
 
 Write updated strategy notes based on this performance data."""
 
@@ -153,12 +150,12 @@ Total resolved trades: {stats['total']} | Win rate: {stats.get('win_rate',0)*100
         description = (market.get("description") or "")[:200]
         search_text = "\n".join(f"- {s[:120]}" for s in snippets[:4]) if snippets else "No results."
 
-        # Show Claude the actual max it can deploy so sizing is meaningful
+        # Show Claude the real max so size_fraction is meaningful
+        max_size = self.config.compute_trade_size(balance, 1.0)
         if balance and balance > 0:
-            max_size = self.config.compute_trade_size(balance, 1.0)
-            balance_line = f"Balance: ${balance:.2f} | Max trade: ${max_size:.2f} (size_fraction=1.0)"
+            balance_line = f"Wallet: ${balance:.2f} USDC | Max trade (size_fraction=1.0): ${max_size:.2f}"
         else:
-            balance_line = f"Max trade: ${self.config.max_trade_usdc:.2f} (size_fraction=1.0)"
+            balance_line = f"Max trade (size_fraction=1.0): ${max_size:.2f}"
 
         return f"""Market: {question}
 Desc: {description}
