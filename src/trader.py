@@ -29,13 +29,9 @@ class Trader:
     def _build_client(self) -> ClobClient:
         """
         Initialise the Polymarket CLOB client.
-
-        Polymarket embedded wallets use signature_type=0 (EOA).
-        We pass the API key/secret/passphrase directly from env vars
-        rather than trying to derive them (which caused the 400 error).
+        Derives API credentials directly from the wallet private key
+        to ensure they match — manual key entry often causes silent auth failures.
         """
-        from py_clob_client.clob_types import ApiCreds
-
         client = ClobClient(
             host=self.config.clob_host,
             chain_id=POLYGON,
@@ -44,14 +40,23 @@ class Trader:
             funder=self.config.wallet_private_key,
         )
 
-        # Use the API credentials you generated on polymarket.com directly
-        creds = ApiCreds(
-            api_key=self.config.poly_api_key,
-            api_secret=self.config.poly_api_secret,
-            api_passphrase=self.config.poly_api_passphrase,
-        )
-        client.set_api_creds(creds)
-        log.info("CLOB client initialised")
+        try:
+            # Try to derive credentials from the private key directly
+            # This is more reliable than manually entered API keys
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+            log.info(f"CLOB client initialised (derived creds, key: {creds.api_key[:8]}...)")
+        except Exception as e:
+            log.warning(f"Could not derive creds ({e}), falling back to env var credentials")
+            from py_clob_client.clob_types import ApiCreds
+            creds = ApiCreds(
+                api_key=self.config.poly_api_key,
+                api_secret=self.config.poly_api_secret,
+                api_passphrase=self.config.poly_api_passphrase,
+            )
+            client.set_api_creds(creds)
+            log.info("CLOB client initialised (env var creds)")
+
         return client
 
     async def place_order(self, market: dict, trade: dict) -> dict[str, Any]:
@@ -61,13 +66,14 @@ class Trader:
         """
         token_id = self._get_token_id(market, trade["outcome"])
         if not token_id:
+            log.error(f"Could not find token_id for {trade['outcome']} in market {market.get('id')}. Tokens: {market.get('tokens')}")
             return {"success": False, "error": "Could not find token_id for outcome"}
 
         price = float(trade["price"])
         size = float(trade["usdc_size"])
-
-        # Convert USDC size to shares (shares = USDC / price for YES)
         shares = round(size / price, 2)
+
+        log.info(f"Placing order: {trade['outcome']} {shares} shares @ {price} (${size} USDC) market={market.get('id')}")
 
         order_args = OrderArgs(
             token_id=token_id,
@@ -77,8 +83,11 @@ class Trader:
         )
 
         try:
+            log.info(f"Signing order: {trade['outcome']} {shares} shares @ {price} token_id={token_id[:16]}...")
             signed_order = self._client.create_and_sign_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.GTC)  # Good-Till-Cancelled
+            log.info(f"Order signed, submitting to CLOB...")
+            resp = self._client.post_order(signed_order, OrderType.GTC)
+            log.info(f"CLOB response: {resp}")
 
             success = resp.get("success", False) or resp.get("orderID") is not None
             order_id = resp.get("orderID") or resp.get("order_id", "")
