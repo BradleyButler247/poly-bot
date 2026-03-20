@@ -1,14 +1,32 @@
 """
-Resolution Checker — periodically polls Polymarket to find
-which markets we traded have now resolved, then records the
-actual P&L so the learning loop can use real outcomes.
+Resolution Checker — monitors open positions each cycle for:
+  1. Natural market resolution  → records full realised P&L
+  2. Partial take-profit exits  → scales out in tiers as gains accumulate
+  3. Full stop-loss exit        → closes entire position on large loss
+
+Partial exit tiers (configurable via PARTIAL_EXIT_TIERS env var):
+  Tier 1: +100% gain → sell 33% of remaining shares  (lock in profit, stay long)
+  Tier 2: +200% gain → sell 33% of remaining shares  (lock in more, still long)
+  Tier 3: +400% gain → sell 50% of remaining shares  (aggressive trim)
+  Each tier fires exactly once per position, tracked in trade["partial_exits"].
+
+Stop-loss:
+  Full exit when unrealised loss >= STOP_LOSS_PCT (default 50%)
+
+The open trade record tracks:
+  - shares_remaining: decreases as partial exits fire
+  - cost_basis_remaining: proportionally reduced cost basis
+  - partial_exits: list of {tier_gain_pct, shares_sold, sell_price, pnl, ts}
+  - token_id: required for placing sell orders
 """
 
 import json
 import logging
 import os
-import aiohttp
+from datetime import datetime, timezone
 from typing import Optional
+
+import aiohttp
 
 from .config import Config
 from .audit_log import AuditLog
@@ -16,7 +34,6 @@ from .risk_manager import RiskManager
 
 log = logging.getLogger("resolver")
 
-# Tracks open positions we need to monitor: order_id → trade metadata
 OPEN_TRADES_PATH = os.getenv("OPEN_TRADES_PATH", "logs/open_trades.jsonl")
 
 
@@ -29,8 +46,9 @@ class ResolutionChecker:
 
     def record_open_trade(self, market_id: str, question: str, order_id: str,
                           outcome_traded: str, price_paid: float, usdc_size: float,
-                          your_probability: float, strategy_tags: list):
-        """Write a pending trade so we can check its resolution later."""
+                          your_probability: float, strategy_tags: list,
+                          token_id: str = ""):
+        shares = round(usdc_size / price_paid, 4) if price_paid > 0 else 0
         record = {
             "market_id": market_id,
             "question": question,
@@ -38,23 +56,25 @@ class ResolutionChecker:
             "outcome_traded": outcome_traded,
             "price_paid": price_paid,
             "usdc_size": usdc_size,
+            "shares_remaining": shares,        # decreases with partial exits
+            "cost_basis_remaining": usdc_size, # tracks remaining invested capital
             "your_probability": your_probability,
             "strategy_tags": strategy_tags,
+            "token_id": token_id,
+            "partial_exits": [],               # log of each partial exit taken
             "resolved": False,
+            "ts": datetime.now(timezone.utc).isoformat(),
         }
         with open(OPEN_TRADES_PATH, "a") as f:
             f.write(json.dumps(record) + "\n")
+        log.info(f"Recorded open trade: {question[:60]} | {shares} shares @ {price_paid}")
 
     async def check_resolutions(self):
-        """
-        For each unresolved open trade, check if the market has resolved.
-        If it has, compute P&L and log to the learning system.
-        """
         open_trades = self._load_open_trades()
         if not open_trades:
             return
 
-        log.info(f"Checking resolution for {len(open_trades)} open trades")
+        log.info(f"Checking {len(open_trades)} open positions")
         updated = []
 
         for trade in open_trades:
@@ -62,57 +82,234 @@ class ResolutionChecker:
                 updated.append(trade)
                 continue
 
+            # 1. Natural resolution
             resolution = await self._fetch_resolution(trade["market_id"])
-            if resolution is None:
+            if resolution is not None:
+                trade = await self._handle_resolution(trade, resolution)
                 updated.append(trade)
                 continue
 
-            # Market resolved
-            market_resolved_yes = resolution
-            won = (trade["outcome_traded"] == "YES" and market_resolved_yes) or \
-                  (trade["outcome_traded"] == "NO" and not market_resolved_yes)
-
-            price_paid = float(trade["price_paid"])
-            usdc_size = float(trade["usdc_size"])
-
-            if won:
-                # Payout = shares * $1. Shares = usdc_size / price_paid.
-                # Net P&L = (1 - price_paid) / price_paid * usdc_size
-                pnl = round((1.0 - price_paid) / price_paid * usdc_size, 4)
-            else:
-                pnl = -usdc_size
-
-            log.info(
-                f"Market resolved: {trade['question'][:60]}... "
-                f"→ {'WIN' if won else 'LOSS'} ${pnl:+.2f}"
+            # 2. Partial take-profit + stop-loss
+            current_price = await self._fetch_current_outcome_price(
+                trade["market_id"], trade["outcome_traded"]
             )
+            if current_price is not None:
+                trade = await self._check_exit_triggers(trade, current_price)
 
-            self.audit.log_resolved_trade(
-                order_id=trade["order_id"],
-                market_id=trade["market_id"],
-                question=trade["question"],
-                outcome_traded=trade["outcome_traded"],
-                price_paid=price_paid,
-                usdc_size=usdc_size,
-                market_resolved_yes=market_resolved_yes,
-                pnl=pnl,
-                your_probability=float(trade.get("your_probability", 0.5)),
-                strategy_tags=trade.get("strategy_tags", []),
-            )
-
-            self.risk.record_trade_result(trade["market_id"], pnl)
-
-            trade["resolved"] = True
-            trade["pnl"] = pnl
-            trade["won"] = won
             updated.append(trade)
 
         self._save_open_trades(updated)
 
+    async def _handle_resolution(self, trade: dict, market_resolved_yes: bool) -> dict:
+        """Market resolved naturally — pay out remaining shares at $1.00."""
+        won = (trade["outcome_traded"] == "YES" and market_resolved_yes) or \
+              (trade["outcome_traded"] == "NO" and not market_resolved_yes)
+
+        price_paid = float(trade["price_paid"])
+        cost_remaining = float(trade.get("cost_basis_remaining", trade["usdc_size"]))
+        shares_remaining = float(trade.get("shares_remaining", trade["usdc_size"] / price_paid))
+
+        if won:
+            # Remaining shares pay out at $1.00 each
+            pnl = round(shares_remaining - cost_remaining, 4)
+        else:
+            pnl = round(-cost_remaining, 4)
+
+        # Total realised P&L includes all partial exits
+        partial_pnl = sum(p.get("pnl", 0) for p in trade.get("partial_exits", []))
+        total_pnl = round(pnl + partial_pnl, 4)
+
+        log.info(
+            f"Market resolved: {trade['question'][:60]} "
+            f"→ {'WIN' if won else 'LOSS'} "
+            f"final=${pnl:+.2f} partial=${partial_pnl:+.2f} total=${total_pnl:+.2f}"
+        )
+
+        self.audit.log_resolved_trade(
+            order_id=trade["order_id"],
+            market_id=trade["market_id"],
+            question=trade["question"],
+            outcome_traded=trade["outcome_traded"],
+            price_paid=price_paid,
+            usdc_size=float(trade["usdc_size"]),
+            market_resolved_yes=market_resolved_yes,
+            pnl=total_pnl,
+            your_probability=float(trade.get("your_probability", 0.5)),
+            strategy_tags=trade.get("strategy_tags", []),
+        )
+        self.risk.record_trade_result(trade["market_id"], total_pnl)
+
+        trade["resolved"] = True
+        trade["pnl"] = total_pnl
+        trade["won"] = won
+        return trade
+
+    async def _check_exit_triggers(self, trade: dict, current_price: float) -> dict:
+        """
+        Check partial take-profit tiers and full stop-loss.
+        Mutates trade in place, returns updated trade.
+        """
+        price_paid = float(trade["price_paid"])
+        cost_remaining = float(trade.get("cost_basis_remaining", trade["usdc_size"]))
+        shares_remaining = float(trade.get("shares_remaining",
+                                           trade["usdc_size"] / price_paid))
+
+        if shares_remaining <= 0 or cost_remaining <= 0:
+            return trade
+
+        current_value = shares_remaining * current_price
+        unrealised_pct = ((current_value - cost_remaining) / cost_remaining) * 100
+
+        # ── Stop-loss: full exit ─────────────────────────────────────────
+        if unrealised_pct <= -self.config.stop_loss_pct:
+            log.info(
+                f"STOP-LOSS triggered: {trade['question'][:50]} "
+                f"| loss={unrealised_pct:.1f}% — selling all {shares_remaining:.2f} shares"
+            )
+            result = await self._place_sell(trade, shares_remaining, current_price)
+            if result["success"]:
+                sell_price = result["sell_price"]
+                proceeds = shares_remaining * sell_price
+                pnl = round(proceeds - cost_remaining, 4)
+                partial_pnl = sum(p.get("pnl", 0) for p in trade.get("partial_exits", []))
+
+                self.audit.log_resolved_trade(
+                    order_id=trade["order_id"],
+                    market_id=trade["market_id"],
+                    question=trade["question"],
+                    outcome_traded=trade["outcome_traded"],
+                    price_paid=price_paid,
+                    usdc_size=float(trade["usdc_size"]),
+                    market_resolved_yes=None,
+                    pnl=round(pnl + partial_pnl, 4),
+                    your_probability=float(trade.get("your_probability", 0.5)),
+                    strategy_tags=trade.get("strategy_tags", []) + ["stop_loss"],
+                )
+                self.risk.record_trade_result(trade["market_id"], pnl + partial_pnl)
+                trade["resolved"] = True
+                trade["pnl"] = round(pnl + partial_pnl, 4)
+                trade["won"] = False
+            return trade
+
+        # ── Partial take-profit tiers ────────────────────────────────────
+        tiers = self.config.get_partial_exit_tiers()
+        fired_tiers = {p["tier_gain_pct"] for p in trade.get("partial_exits", [])}
+
+        for gain_pct, sell_pct in tiers:
+            if gain_pct in fired_tiers:
+                continue  # already fired
+            if unrealised_pct < gain_pct:
+                continue  # not there yet
+
+            # Calculate shares to sell
+            shares_to_sell = round(shares_remaining * (sell_pct / 100), 4)
+            if shares_to_sell < 0.01:
+                continue
+
+            log.info(
+                f"PARTIAL EXIT tier +{gain_pct:.0f}%: {trade['question'][:50]} "
+                f"| selling {sell_pct:.0f}% = {shares_to_sell:.2f} shares "
+                f"@ ~{current_price:.3f} (unrealised={unrealised_pct:.1f}%)"
+            )
+
+            result = await self._place_sell(trade, shares_to_sell, current_price)
+            if result["success"]:
+                sell_price = result["sell_price"]
+                # Cost basis of the shares being sold (proportional)
+                cost_of_sold = cost_remaining * (sell_pct / 100)
+                proceeds = shares_to_sell * sell_price
+                partial_pnl = round(proceeds - cost_of_sold, 4)
+
+                exit_record = {
+                    "tier_gain_pct": gain_pct,
+                    "sell_pct": sell_pct,
+                    "shares_sold": shares_to_sell,
+                    "sell_price": sell_price,
+                    "cost_of_sold": round(cost_of_sold, 4),
+                    "proceeds": round(proceeds, 4),
+                    "pnl": partial_pnl,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+
+                trade.setdefault("partial_exits", []).append(exit_record)
+                trade["shares_remaining"] = round(shares_remaining - shares_to_sell, 4)
+                trade["cost_basis_remaining"] = round(cost_remaining - cost_of_sold, 4)
+
+                # Update locals for next tier check in same cycle
+                shares_remaining = trade["shares_remaining"]
+                cost_remaining = trade["cost_basis_remaining"]
+                fired_tiers.add(gain_pct)
+
+                log.info(
+                    f"  Partial exit complete: pnl=${partial_pnl:+.2f} "
+                    f"| remaining={shares_remaining:.2f} shares "
+                    f"(cost basis=${cost_remaining:.2f})"
+                )
+            else:
+                log.warning(f"  Partial exit order failed: {result.get('error')}")
+
+        return trade
+
+    async def _place_sell(self, trade: dict, shares: float, current_price: float) -> dict:
+        """Place a limit SELL order at 2% below current price to ensure fill."""
+        token_id = trade.get("token_id")
+        if not token_id:
+            log.warning(f"No token_id on trade {trade.get('order_id')} — cannot sell")
+            return {"success": False, "error": "no token_id"}
+
+        # 2% below current to ensure fill, clamped to valid range
+        sell_price = round(max(0.001, min(0.999, current_price * 0.98)), 3)
+
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.constants import POLYGON
+            import os as _os
+
+            wallet_address = _os.getenv("WALLET_ADDRESS", "")
+            client = ClobClient(
+                host=self.config.clob_host,
+                chain_id=POLYGON,
+                key=self.config.wallet_private_key,
+                signature_type=1,
+                funder=wallet_address,
+            )
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=sell_price,
+                size=round(shares, 2),
+                side="SELL",
+            )
+            resp = client.create_and_post_order(order_args)
+            success = resp.get("success", False) or resp.get("orderID") is not None
+            log.info(f"Sell order response: {resp}")
+            return {"success": success, "sell_price": sell_price, "raw": resp}
+
+        except Exception as e:
+            log.error(f"Sell order exception: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    async def _fetch_current_outcome_price(self, market_id: str, outcome: str) -> Optional[float]:
+        try:
+            url = f"{self.config.gamma_host}/markets/{market_id}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            tokens = data.get("tokens") or []
+            for token in tokens:
+                if str(token.get("outcome", "")).upper() == "YES":
+                    yes_price = float(token.get("price", 0.5))
+                    return yes_price if outcome == "YES" else 1.0 - yes_price
+        except Exception as e:
+            log.warning(f"Price fetch failed for {market_id}: {e}")
+        return None
+
     async def _fetch_resolution(self, market_id: str) -> Optional[bool]:
-        """
-        Returns True if market resolved YES, False if NO, None if still open.
-        """
         url = f"{self.config.gamma_host}/markets/{market_id}"
         try:
             async with aiohttp.ClientSession() as session:
@@ -125,9 +322,8 @@ class ResolutionChecker:
             resolved = data.get("resolved", False)
 
             if not resolved and (active and not closed):
-                return None  # Still open
+                return None
 
-            # Check resolution value
             resolution_val = data.get("resolutionSource") or data.get("resolution")
             if resolution_val:
                 if str(resolution_val).upper() in ("YES", "1", "TRUE"):
@@ -135,7 +331,6 @@ class ResolutionChecker:
                 if str(resolution_val).upper() in ("NO", "0", "FALSE"):
                     return False
 
-            # Fallback: check outcome prices (resolved YES → YES price = 1.0)
             tokens = data.get("tokens") or []
             for token in tokens:
                 if str(token.get("outcome", "")).upper() == "YES":
@@ -144,7 +339,6 @@ class ResolutionChecker:
                         return True
                     if price <= 0.01:
                         return False
-
             return None
 
         except Exception as e:
