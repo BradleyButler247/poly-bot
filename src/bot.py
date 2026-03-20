@@ -49,10 +49,6 @@ class PolymarketBot:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._stop)
 
-        # Give the HTTP server 3 seconds to start before first cycle
-        log.info("Waiting for HTTP server to be ready...")
-        await asyncio.sleep(3)
-
         while self._running:
             try:
                 await self._cycle()

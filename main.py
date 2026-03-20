@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Entry point — runs the trading bot loop and the API server concurrently.
-Railway exposes the PORT env var; the frontend is served from /dashboard.
+Entry point — starts HTTP server first, then launches the trading bot.
+Railway health checks the /health endpoint before marking deployment successful.
 """
 import asyncio
 import sys
@@ -10,21 +10,31 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import uvicorn
-from src.bot import PolymarketBot
 from src.api_server import app
 
 
-async def main():
+async def run_bot():
+    """Import and run bot after a delay so HTTP server starts first."""
+    # Wait for uvicorn to bind and pass the health check
+    await asyncio.sleep(10)
+    from src.bot import PolymarketBot
     bot = PolymarketBot()
+    await bot.run()
 
+
+async def main():
     port = int(os.getenv("PORT", "8000"))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="warning",
+    )
     server = uvicorn.Server(config)
 
-    # Bot trading loop + HTTP server run side by side
     await asyncio.gather(
-        bot.run(),
         server.serve(),
+        run_bot(),
     )
 
 
