@@ -86,29 +86,39 @@ async def _fetch_current_price(market_id: str) -> Optional[float]:
 
 
 async def _fetch_wallet_balance(wallet_address: str) -> Optional[float]:
-    """Fetch USDC balance on Polygon. Tries both native USDC and bridged USDC.e."""
-    # Both contract addresses used on Polygon
+    """Fetch USDC balance from Polymarket CLOB API."""
+    try:
+        url = f"{CLOB_HOST}/balance-allowance"
+        params = {"asset_type": "USDC", "signature_type": 0}
+        headers = {"poly-address": wallet_address}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    balance = data.get("balance") or data.get("allowance") or 0
+                    return float(balance) / 1e6  # USDC has 6 decimals
+    except Exception as e:
+        log.warning(f"Balance fetch failed: {e}")
+
+    # Fallback: try both USDC contracts on Polygon
     contracts = [
-        ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6),   # Native USDC (Circle)
-        ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6),   # USDC.e (bridged) — Polymarket uses this
+        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Native USDC
+        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e bridged
     ]
     RPC = "https://polygon-rpc.com"
     total = 0.0
     addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
-    for contract, decimals in contracts:
+    for contract in contracts:
         data = "0x70a08231" + addr_padded
-        payload = {
-            "jsonrpc": "2.0", "method": "eth_call",
-            "params": [{"to": contract, "data": data}, "latest"],
-            "id": 1,
-        }
+        payload = {"jsonrpc": "2.0", "method": "eth_call",
+                   "params": [{"to": contract, "data": data}, "latest"], "id": 1}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(RPC, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.post(RPC, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     result = await resp.json()
-            hex_val = result.get("result", "0x0")
-            raw = int(hex_val, 16)
-            total += raw / (10 ** decimals)
+            total += int(result.get("result", "0x0"), 16) / 1e6
         except Exception:
             pass
     return total
@@ -242,6 +252,12 @@ async def pnl_curve():
 
     return points
 
+
+@app.get("/api/audit")
+async def audit_log(limit: int = 20):
+    """Return raw audit log entries for debugging."""
+    records = _load_jsonl(AUDIT_LOG_PATH)
+    return records[-limit:]
 
 @app.get("/api/debug")
 async def debug():
