@@ -138,6 +138,7 @@ class ResolutionChecker:
             pnl=total_pnl,
             your_probability=float(trade.get("your_probability", 0.5)),
             strategy_tags=trade.get("strategy_tags", []),
+            exit_type="resolution",
         )
         self.risk.record_trade_result(trade["market_id"], total_pnl)
 
@@ -184,6 +185,7 @@ class ResolutionChecker:
                     pnl=total_pnl,
                     your_probability=float(trade.get("your_probability", 0.5)),
                     strategy_tags=trade.get("strategy_tags", []) + ["stop_loss"],
+                    exit_type="stop_loss",
                 )
                 self.risk.record_trade_result(trade["market_id"], total_pnl)
                 trade["resolved"] = True
@@ -234,6 +236,21 @@ class ResolutionChecker:
                 shares_remaining = trade["shares_remaining"]
                 cost_remaining = trade["cost_basis_remaining"]
                 fired_tiers.add(gain_pct)
+
+                # Log partial exit to resolved log so learning loop can see it
+                self.audit.log_resolved_trade(
+                    order_id=trade["order_id"],
+                    market_id=trade["market_id"],
+                    question=trade["question"],
+                    outcome_traded=trade["outcome_traded"],
+                    price_paid=float(trade["price_paid"]),
+                    usdc_size=round(cost_of_sold, 4),
+                    market_resolved_yes=None,
+                    pnl=partial_pnl,
+                    your_probability=float(trade.get("your_probability", 0.5)),
+                    strategy_tags=trade.get("strategy_tags", []),
+                    exit_type="partial_take_profit",
+                )
 
                 log.info(
                     f"  Partial exit done: pnl=${partial_pnl:+.2f} "

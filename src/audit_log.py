@@ -1,6 +1,7 @@
 """
 Audit Log — append-only JSONL log of every bot decision.
-Also tracks resolved trade outcomes for the learning loop.
+Tracks resolved trades, partial exits, stop-losses, and open position
+price drift for the fast-learning loop.
 """
 
 import json
@@ -13,6 +14,7 @@ log = logging.getLogger("audit")
 
 AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "logs/audit.jsonl")
 RESOLVED_LOG_PATH = os.getenv("RESOLVED_LOG_PATH", "logs/resolved.jsonl")
+OPEN_TRADES_PATH = os.getenv("OPEN_TRADES_PATH", "logs/open_trades.jsonl")
 STRATEGY_PATH = os.getenv("STRATEGY_PATH", "logs/strategy.json")
 
 
@@ -59,14 +61,23 @@ class AuditLog:
 
     def log_resolved_trade(self, order_id: str, market_id: str, question: str,
                            outcome_traded: str, price_paid: float, usdc_size: float,
-                           market_resolved_yes: bool, pnl: float,
-                           your_probability: float, strategy_tags: list):
+                           market_resolved_yes: Optional[bool], pnl: float,
+                           your_probability: float, strategy_tags: list,
+                           exit_type: str = "resolution"):
         """
-        Call this when a market resolves and we know the P&L.
-        These records are what Claude learns from.
+        Record a closed position. exit_type distinguishes how it closed:
+          - resolution: natural market resolution
+          - partial_take_profit: tiered partial exit
+          - stop_loss: full stop-loss exit
+        This lets the learning loop treat each exit type differently.
         """
-        won = (outcome_traded == "YES" and market_resolved_yes) or \
-              (outcome_traded == "NO" and not market_resolved_yes)
+        # won is meaningful for resolution; for early exits it reflects P&L sign
+        if market_resolved_yes is not None:
+            won = (outcome_traded == "YES" and market_resolved_yes) or \
+                  (outcome_traded == "NO" and not market_resolved_yes)
+        else:
+            won = pnl > 0
+
         self._write(RESOLVED_LOG_PATH, {
             "event": "resolved",
             "order_id": order_id,
@@ -80,6 +91,7 @@ class AuditLog:
             "pnl": pnl,
             "your_probability": your_probability,
             "strategy_tags": strategy_tags,
+            "exit_type": exit_type,  # resolution | partial_take_profit | stop_loss
         })
 
     def log_risk_block(self, cycle_id: str, market_id: str, trade: dict, reason: str):
@@ -98,24 +110,19 @@ class AuditLog:
         self._write(AUDIT_LOG_PATH, {"event": "error", "error": error})
 
     def save_strategy_notes(self, notes: str):
-        """Persist Claude's latest strategy critique to disk."""
         with open(STRATEGY_PATH, "w") as f:
             json.dump({"notes": notes, "updated": _now()}, f, indent=2)
-        log.info("Strategy notes updated")
 
     def load_strategy_notes(self) -> Optional[str]:
-        """Load the last strategy critique Claude wrote."""
         try:
             with open(STRATEGY_PATH) as f:
-                data = json.load(f)
-                return data.get("notes")
+                return json.load(f).get("notes")
         except FileNotFoundError:
             return None
 
     # ── Read resolved trades ────────────────────────────────────────────────
 
     def get_resolved_trades(self, limit: int = 50) -> list[dict]:
-        """Return the most recent resolved trades for the learning loop."""
         trades = []
         try:
             with open(RESOLVED_LOG_PATH) as f:
@@ -131,7 +138,7 @@ class AuditLog:
         return trades[-limit:]
 
     def get_performance_summary(self) -> dict:
-        """Aggregate stats over all resolved trades."""
+        """Aggregate stats over all resolved trades, broken down by exit type and tag."""
         trades = self.get_resolved_trades(limit=10000)
         if not trades:
             return {"total": 0}
@@ -146,11 +153,25 @@ class AuditLog:
         tag_stats: dict[str, dict] = {}
         for t in trades:
             for tag in t.get("strategy_tags", []):
-                s = tag_stats.setdefault(tag, {"wins": 0, "total": 0, "pnl": 0})
+                s = tag_stats.setdefault(tag, {"wins": 0, "total": 0, "pnl": 0.0, "stop_losses": 0, "partial_exits": 0})
                 s["total"] += 1
                 s["pnl"] += t.get("pnl", 0)
                 if t.get("won"):
                     s["wins"] += 1
+                if t.get("exit_type") == "stop_loss":
+                    s["stop_losses"] += 1
+                if t.get("exit_type") == "partial_take_profit":
+                    s["partial_exits"] += 1
+
+        # Break down by exit type
+        exit_stats: dict[str, dict] = {}
+        for t in trades:
+            et = t.get("exit_type", "resolution")
+            s = exit_stats.setdefault(et, {"wins": 0, "total": 0, "pnl": 0.0})
+            s["total"] += 1
+            s["pnl"] += t.get("pnl", 0)
+            if t.get("won"):
+                s["wins"] += 1
 
         return {
             "total": total,
@@ -161,7 +182,53 @@ class AuditLog:
             "roi_pct": round(roi, 2),
             "recent_10": trades[-10:],
             "tag_stats": tag_stats,
+            "exit_stats": exit_stats,
         }
+
+    def get_open_position_drift(self) -> dict:
+        """
+        Fast-learning: for each open position, compute unrealised P&L drift.
+        Returns per-strategy-tag drift so the analyst can adjust sizing.
+        Called every cycle, not just every 5.
+        """
+        tag_drift: dict[str, dict] = {}
+        try:
+            with open(OPEN_TRADES_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        t = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if t.get("resolved"):
+                        continue
+
+                    price_paid = float(t.get("price_paid", 0.5))
+                    cost_remaining = float(t.get("cost_basis_remaining", t.get("usdc_size", 0)))
+                    shares_remaining = float(t.get("shares_remaining",
+                                                   t.get("usdc_size", 0) / price_paid if price_paid else 0))
+
+                    # We don't have live price here — use partial_exits trend as proxy
+                    # Positive partial exits = position moved our way
+                    partial_pnl = sum(p.get("pnl", 0) for p in t.get("partial_exits", []))
+                    partial_exits_count = len(t.get("partial_exits", []))
+
+                    for tag in t.get("strategy_tags", []):
+                        d = tag_drift.setdefault(tag, {
+                            "open_count": 0,
+                            "total_cost": 0.0,
+                            "partial_pnl_realised": 0.0,
+                            "partial_exits_fired": 0,
+                        })
+                        d["open_count"] += 1
+                        d["total_cost"] += cost_remaining
+                        d["partial_pnl_realised"] += partial_pnl
+                        d["partial_exits_fired"] += partial_exits_count
+        except FileNotFoundError:
+            pass
+        return tag_drift
 
     # ── Private ─────────────────────────────────────────────────────────────
 
