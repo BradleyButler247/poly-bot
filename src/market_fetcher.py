@@ -21,7 +21,7 @@ class MarketFetcher:
         log.info(f"Fetched {len(markets)} raw markets from Gamma API")
 
         candidates = []
-        filter_counts = {"liquidity": 0, "outcomes": 0, "expired": 0, "category": 0}
+        filter_counts = {}
         for m in markets:
             passed, reason = self._passes_prefilter(m)
             if passed:
@@ -30,14 +30,33 @@ class MarketFetcher:
                 filter_counts[reason] = filter_counts.get(reason, 0) + 1
 
         log.info(f"Pre-filter results: {len(candidates)} passed, filtered out → {filter_counts}")
-        candidates.sort(key=lambda m: float(m.get("liquidity") or 0), reverse=True)
+
+        # Score markets: prefer higher liquidity AND closer resolution date
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        def score(m):
+            liquidity = float(m.get("liquidity") or 0)
+            end_date = m.get("endDate") or m.get("end_date_iso")
+            days_left = 365  # default if unknown
+            if end_date:
+                try:
+                    closes = datetime.datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    days_left = max(1, (closes - now).total_seconds() / 86400)
+                except Exception:
+                    pass
+            # Favour markets resolving within 30 days and with good liquidity
+            recency_bonus = max(0, (30 - days_left) / 30) * 5000
+            return liquidity + recency_bonus
+
+        candidates.sort(key=score, reverse=True)
         return candidates[: self.config.max_markets_per_cycle]
 
     async def _fetch_active_markets(self) -> list[dict]:
         params = {
             "active": "true",
             "closed": "false",
-            "limit": 100,
+            "limit": 200,
             "order": "liquidity",
             "ascending": "false",
         }
