@@ -142,11 +142,12 @@ class MarketFetcher:
         if not has_token_ids:
             return False, "no_token_ids"
 
-        # Skip near-resolved markets (YES price > 0.95 or < 0.05)
+        # Skip near-resolved markets — YES price outside 0.10-0.90
+        # Markets at extremes have no real edge and cause price clamping issues
         for token in tokens:
             if str(token.get("outcome", "")).upper() == "YES":
                 price = float(token.get("price") or 0.5)
-                if price > 0.95 or price < 0.05:
+                if price > 0.90 or price < 0.10:
                     return False, "near_resolved"
 
         # Skip markets resolving in < 1 hour
@@ -165,6 +166,11 @@ class MarketFetcher:
             tags = [t.lower() for t in (market.get("tags") or [])]
             if not any(cat.lower() in tags for cat in self.config.market_categories):
                 return False, "category"
+
+        # Skip markets with very short or generic questions (usually bad data)
+        question = market.get("question") or ""
+        if len(question) < 15:
+            return False, "liquidity"
 
         return True, "ok"
 

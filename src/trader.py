@@ -71,6 +71,16 @@ class Trader:
             return {"success": False, "error": "Could not find token_id for outcome"}
 
         price = float(trade["price"])
+        outcome = trade["outcome"]
+
+        # When buying NO, the correct limit price is 1 - YES_price.
+        # Claude sometimes sets price=1.0 for near-certain NO trades which
+        # the CLOB rejects (valid range: 0.001 - 0.999).
+        # Clamp to valid range and round to nearest tick (0.01 default).
+        price = max(0.001, min(0.999, price))
+        # Round to 3 decimal places (standard tick size)
+        price = round(price, 3)
+
         size = float(trade["usdc_size"])
         shares = round(size / price, 2)
 
