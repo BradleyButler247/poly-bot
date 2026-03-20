@@ -1,5 +1,5 @@
 """
-Configuration — all values come from environment variables.
+Configuration — all values from environment variables.
 Set these in Railway's Variables tab.
 """
 
@@ -16,19 +16,36 @@ class Config:
     poly_api_key: str = field(default_factory=lambda: _require("POLY_API_KEY"))
     poly_api_secret: str = field(default_factory=lambda: _require("POLY_API_SECRET"))
     poly_api_passphrase: str = field(default_factory=lambda: _require("POLY_API_PASSPHRASE"))
-    # Polymarket embedded wallet private key
-    # Export from: polymarket.com → Profile → Settings → Export private key
     wallet_private_key: str = field(default_factory=lambda: _require("WALLET_PRIVATE_KEY"))
 
-    # ── Risk limits (circuit breakers only — no edge floor) ───────────────
-    max_trade_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_TRADE_USDC", "20")))
+    # ── Risk limits ────────────────────────────────────────────────────────
+    # Hard cap per trade in USDC — safety ceiling regardless of balance
+    max_trade_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_TRADE_USDC", "50")))
     max_daily_loss_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_USDC", "100")))
-    max_position_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_USDC", "50")))
+    max_position_usdc: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_USDC", "100")))
     min_liquidity_usdc: float = field(default_factory=lambda: float(os.getenv("MIN_LIQUIDITY_USDC", "1000")))
 
+    # ── Balance-relative sizing ────────────────────────────────────────────
+    # Max % of wallet balance to risk on a single trade.
+    # e.g. 0.05 = 5% of balance per trade.
+    # Claude's size_fraction (0-1) scales within this envelope.
+    # Final size = balance * max_trade_pct * size_fraction
+    # Hard-capped at max_trade_usdc regardless.
+    max_trade_pct: float = field(default_factory=lambda: float(os.getenv("MAX_TRADE_PCT", "0.05")))
+
+    # Minimum trade size — don't bother placing orders below this
+    min_trade_usdc: float = field(default_factory=lambda: float(os.getenv("MIN_TRADE_USDC", "2.0")))
+
+    # ── Exit thresholds ────────────────────────────────────────────────────
+    stop_loss_pct: float = field(default_factory=lambda: float(os.getenv("STOP_LOSS_PCT", "50")))
+    # Partial take-profit tiers: "gain_pct:sell_pct,..."
+    partial_exit_tiers: str = field(
+        default_factory=lambda: os.getenv("PARTIAL_EXIT_TIERS", "100:33,200:33,400:50")
+    )
+
     # ── Bot behaviour ──────────────────────────────────────────────────────
-    cycle_interval_seconds: int = field(default_factory=lambda: int(os.getenv("CYCLE_INTERVAL_SECONDS", "300")))
-    max_markets_per_cycle: int = field(default_factory=lambda: int(os.getenv("MAX_MARKETS_PER_CYCLE", "15")))
+    cycle_interval_seconds: int = field(default_factory=lambda: int(os.getenv("CYCLE_INTERVAL_SECONDS", "120")))
+    max_markets_per_cycle: int = field(default_factory=lambda: int(os.getenv("MAX_MARKETS_PER_CYCLE", "20")))
     market_categories: list = field(
         default_factory=lambda: [
             c.strip() for c in os.getenv("MARKET_CATEGORIES", "").split(",") if c.strip()
@@ -40,13 +57,45 @@ class Config:
     kelly_fraction: float = field(default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.3")))
 
     # ── Learning loop ──────────────────────────────────────────────────────
-    # Resolved trades fed back into Claude's context for strategy refinement
     learning_lookback_trades: int = field(default_factory=lambda: int(os.getenv("LEARNING_LOOKBACK_TRADES", "50")))
     min_trades_for_learning: int = field(default_factory=lambda: int(os.getenv("MIN_TRADES_FOR_LEARNING", "5")))
 
     # ── Polymarket hosts ───────────────────────────────────────────────────
     clob_host: str = field(default_factory=lambda: os.getenv("CLOB_HOST", "https://clob.polymarket.com"))
     gamma_host: str = field(default_factory=lambda: os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com"))
+
+    def get_partial_exit_tiers(self) -> list[tuple[float, float]]:
+        tiers = []
+        try:
+            for part in self.partial_exit_tiers.split(","):
+                gain, sell = part.strip().split(":")
+                tiers.append((float(gain), float(sell)))
+        except Exception:
+            tiers = [(100.0, 33.0), (200.0, 33.0), (400.0, 50.0)]
+        return sorted(tiers, key=lambda t: t[0])
+
+    def compute_trade_size(self, balance: float | None, size_fraction: float) -> float:
+        """
+        Compute actual USDC trade size from live balance.
+
+        Formula: balance * max_trade_pct * size_fraction
+        Capped at max_trade_usdc, floored at min_trade_usdc.
+
+        If balance is unavailable falls back to max_trade_usdc * size_fraction.
+        """
+        size_fraction = max(0.05, min(1.0, size_fraction))
+
+        if balance and balance > 0:
+            # Scale trade size to wallet — grows as account grows, shrinks as it shrinks
+            size = balance * self.max_trade_pct * size_fraction
+        else:
+            # Fallback: use fixed cap when balance unavailable
+            size = self.max_trade_usdc * size_fraction
+
+        # Hard ceiling and floor
+        size = min(size, self.max_trade_usdc)
+        size = max(size, self.min_trade_usdc)
+        return round(size, 2)
 
 
 def _require(key: str) -> str:

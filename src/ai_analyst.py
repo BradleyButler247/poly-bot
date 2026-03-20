@@ -1,15 +1,6 @@
 """
-AI Analyst — uses Claude to reason about markets and maximise expected value.
-
-Each analysis cycle Claude receives:
-  - Market question + current odds + liquidity
-  - Recent web search results
-  - Performance stats from past trades
-  - Strategy notes Claude wrote after reviewing past failures/successes
-  - Categorised breakdown of what's working and what isn't
-
-Claude outputs a trade decision with EV-based sizing (no minimum edge floor).
-After enough trades accumulate, Claude also writes updated strategy notes.
+AI Analyst — uses Claude to reason about markets and size trades
+relative to current wallet balance.
 """
 
 import json
@@ -44,10 +35,11 @@ Output ONLY valid JSON:
   "market_price": 0.0-1.0,
   "edge": 0.0-1.0,
   "ev_score": -1.0-1.0,
-  "trade": {"outcome": "YES"|"NO", "price": 0.0-1.0, "size_fraction": 0.0-1.0, "usdc_size": 0.0},
+  "trade": {"outcome": "YES"|"NO", "price": 0.0-1.0, "size_fraction": 0.0-1.0},
   "confidence": "low"|"medium"|"high",
   "strategy_tags": ["tag"]
 }
+size_fraction is 0-1 relative to your max allowed trade size.
 trade only required when should_trade is true."""
 
 
@@ -61,14 +53,14 @@ class AIAnalyst:
         self.client = anthropic.Anthropic(api_key=config.anthropic_api_key)
         self._cycle_count = 0
 
-    async def analyse(self, market: dict) -> dict:
+    async def analyse(self, market: dict, balance: float | None = None) -> dict:
         question = market["question"]
         yes_price = self._get_yes_price(market)
 
         search_snippets = await self._search_context(question)
         strategy_context = self._build_strategy_context()
         system = BASE_SYSTEM_PROMPT + strategy_context
-        user_prompt = self._build_prompt(market, yes_price, search_snippets)
+        user_prompt = self._build_prompt(market, yes_price, search_snippets, balance)
 
         response = self.client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -80,19 +72,16 @@ class AIAnalyst:
         raw = response.content[0].text.strip()
         result = self._parse_response(raw, yes_price)
 
-        # Apply size_fraction to get actual USDC size
+        # Convert size_fraction → actual USDC using balance-relative sizing
         if result.get("should_trade") and result.get("trade"):
             fraction = float(result["trade"].get("size_fraction", 0.5))
-            fraction = max(0.05, min(1.0, fraction))
-            result["trade"]["usdc_size"] = round(self.config.max_trade_usdc * fraction, 2)
+            usdc_size = self.config.compute_trade_size(balance, fraction)
+            result["trade"]["usdc_size"] = usdc_size
+            result["trade"]["size_fraction"] = fraction
 
         return result
 
     async def maybe_update_strategy(self):
-        """
-        Periodically ask Claude to review past performance and update strategy notes.
-        Runs every 10 cycles if we have enough resolved trades.
-        """
         self._cycle_count += 1
         if self._cycle_count % 10 != 0:
             return
@@ -134,13 +123,8 @@ Write updated strategy notes based on this performance data."""
         except Exception as e:
             log.error(f"Strategy critique failed: {e}")
 
-    # ── Private ──────────────────────────────────────────────────────────────
-
     def _build_strategy_context(self) -> str:
-        """Append learned strategy notes + recent stats to the system prompt."""
         parts = []
-
-        # Performance stats
         stats = self.audit.get_performance_summary()
         if stats.get("total", 0) >= self.config.min_trades_for_learning:
             parts.append(f"""
@@ -155,24 +139,31 @@ Total resolved trades: {stats['total']} | Win rate: {stats.get('win_rate',0)*100
                     lines.append(f"  {tag}: {s['total']} trades, {wr:.0f}% win rate, ${s['pnl']:.2f} P&L")
                 parts.append("\n".join(lines))
 
-        # Strategy notes from last self-critique
         notes = self.audit.load_strategy_notes()
         if notes:
             parts.append(f"\n## Your own strategy notes (written after reviewing past trades)\n{notes}")
 
         return "\n".join(parts) if parts else ""
 
-    def _build_prompt(self, market: dict, yes_price: float, snippets: list[str]) -> str:
+    def _build_prompt(self, market: dict, yes_price: float,
+                      snippets: list[str], balance: float | None) -> str:
         question = market["question"]
         liquidity = float(market.get("liquidity") or 0)
         end_date = market.get("endDate") or market.get("end_date_iso") or "Unknown"
         description = (market.get("description") or "")[:200]
         search_text = "\n".join(f"- {s[:120]}" for s in snippets[:4]) if snippets else "No results."
 
+        # Show Claude the actual max it can deploy so sizing is meaningful
+        if balance and balance > 0:
+            max_size = self.config.compute_trade_size(balance, 1.0)
+            balance_line = f"Balance: ${balance:.2f} | Max trade: ${max_size:.2f} (size_fraction=1.0)"
+        else:
+            balance_line = f"Max trade: ${self.config.max_trade_usdc:.2f} (size_fraction=1.0)"
+
         return f"""Market: {question}
 Desc: {description}
 YES: {yes_price:.3f} | NO: {1-yes_price:.3f} | Liq: ${liquidity:,.0f} | Resolves: {end_date}
-Max: ${self.config.max_trade_usdc:.0f}
+{balance_line}
 News:
 {search_text}
 Return JSON."""
