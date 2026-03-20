@@ -1,16 +1,16 @@
 """
-API Server — lightweight FastAPI server that runs alongside the bot
-and exposes trading data as JSON endpoints for the frontend dashboard.
+API Server — FastAPI with WebSocket for real-time dashboard updates.
 """
 
+import asyncio
 import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Set
 
 import aiohttp
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -22,17 +22,30 @@ RESOLVED_LOG_PATH = os.getenv("RESOLVED_LOG_PATH", "logs/resolved.jsonl")
 OPEN_TRADES_PATH = os.getenv("OPEN_TRADES_PATH", "logs/open_trades.jsonl")
 GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
-
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
 app = FastAPI(title="Polymarket Bot API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+connected_clients: Set[WebSocket] = set()
+
+
+async def broadcast(event: str, data: dict):
+    if not connected_clients:
+        return
+    message = json.dumps({"event": event, "data": data})
+    dead = set()
+    for ws in connected_clients:
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.add(ws)
+    connected_clients.difference_update(dead)
 
 
 def _load_jsonl(path: str) -> list[dict]:
@@ -79,16 +92,10 @@ async def _fetch_current_price(market_id: str) -> Optional[float]:
 
 
 async def _fetch_wallet_balance() -> Optional[float]:
-    """
-    Fetch USDC.e balance directly from Polygon blockchain.
-    Uses the proxy wallet address (WALLET_ADDRESS env var).
-    USDC.e contract per official Polymarket docs: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-    """
     wallet_address = os.getenv("WALLET_ADDRESS", "")
     if not wallet_address:
         return None
 
-    # Direct Polygon RPC call — no auth needed, just reads the blockchain
     USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     RPC_ENDPOINTS = [
         "https://polygon-rpc.com",
@@ -97,12 +104,10 @@ async def _fetch_wallet_balance() -> Optional[float]:
     ]
 
     addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
-    data = "0x70a08231" + addr_padded  # balanceOf(address)
+    call_data = "0x70a08231" + addr_padded
     payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [{"to": USDC_E, "data": data}, "latest"],
-        "id": 1,
+        "jsonrpc": "2.0", "method": "eth_call",
+        "params": [{"to": USDC_E, "data": call_data}, "latest"], "id": 1,
     }
 
     for rpc in RPC_ENDPOINTS:
@@ -114,16 +119,12 @@ async def _fetch_wallet_balance() -> Optional[float]:
             hex_val = result.get("result", "0x0")
             if hex_val and hex_val != "0x":
                 raw = int(hex_val, 16)
-                balance = raw / 1e6  # USDC.e has 6 decimals
+                balance = raw / 1e6
                 if balance > 0:
-                    log.info(f"Balance fetched from {rpc}: ${balance:.2f}")
                     return balance
-        except Exception as e:
-            log.debug(f"RPC {rpc} failed: {e}")
+        except Exception:
             continue
 
-    # If all RPCs return 0 or fail, try fetching from Polymarket's CLOB
-    # The CLOB balance endpoint reflects trading balance not on-chain balance
     try:
         url = f"{CLOB_HOST}/balance-allowance"
         params = {"asset_type": "USDC", "signature_type": 1}
@@ -133,7 +134,6 @@ async def _fetch_wallet_balance() -> Optional[float]:
                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    log.debug(f"CLOB balance response: {data}")
                     balance = float(data.get("balance", 0) or 0)
                     return balance / 1e6
     except Exception as e:
@@ -142,19 +142,15 @@ async def _fetch_wallet_balance() -> Optional[float]:
     return None
 
 
-@app.get("/api/summary")
-async def summary():
+async def _build_summary():
     resolved = _load_resolved_trades()
     open_trades = _load_open_trades()
-
     total_pnl = sum(t.get("pnl", 0) for t in resolved)
     total_wagered = sum(t.get("usdc_size", 0) for t in resolved)
     wins = sum(1 for t in resolved if t.get("won"))
     total = len(resolved)
     open_volume = sum(t.get("usdc_size", 0) for t in open_trades)
-
     balance = await _fetch_wallet_balance()
-
     return {
         "total_pnl_usd": round(total_pnl, 2),
         "total_pnl_pct": round(total_pnl / total_wagered * 100, 2) if total_wagered else 0,
@@ -168,25 +164,28 @@ async def summary():
     }
 
 
-@app.get("/api/positions/open")
-async def open_positions():
+async def _build_open_positions():
+    """Open positions with UNREALISED P&L (live price vs entry price)."""
     trades = _load_open_trades()
     result = []
-
     for t in trades:
         outcome = t.get("outcome_traded", "YES")
         price_paid = float(t.get("price_paid", 0.5))
         usdc_size = float(t.get("usdc_size", 0))
         shares = usdc_size / price_paid if price_paid > 0 else 0
 
-        current_price = await _fetch_current_price(t.get("market_id", ""))
-        if current_price is None:
-            current_price = price_paid
+        # Fetch live YES price
+        current_yes_price = await _fetch_current_price(t.get("market_id", ""))
+        if current_yes_price is None:
+            current_yes_price = price_paid if outcome == "YES" else 1 - price_paid
 
-        if outcome == "NO":
-            current_price = 1.0 - current_price
+        # P&L from the perspective of the outcome we bought
+        if outcome == "YES":
+            current_outcome_price = current_yes_price
+        else:
+            current_outcome_price = 1.0 - current_yes_price
 
-        current_value = shares * current_price
+        current_value = shares * current_outcome_price
         unrealised_pnl = current_value - usdc_size
         unrealised_pct = (unrealised_pnl / usdc_size * 100) if usdc_size else 0
 
@@ -195,12 +194,14 @@ async def open_positions():
             "question": t.get("question"),
             "outcome_traded": outcome,
             "price_paid": round(price_paid, 4),
-            "current_price": round(current_price, 4),
+            "current_price": round(current_outcome_price, 4),
             "usdc_size": round(usdc_size, 2),
             "shares": round(shares, 2),
             "current_value": round(current_value, 2),
-            "unrealised_pnl_usd": round(unrealised_pnl, 2),
-            "unrealised_pnl_pct": round(unrealised_pct, 2),
+            # Unrealised P&L — position still open
+            "pnl_usd": round(unrealised_pnl, 2),
+            "pnl_pct": round(unrealised_pct, 2),
+            "pnl_type": "unrealised",
             "date_opened": t.get("ts"),
             "strategy_tags": t.get("strategy_tags", []),
             "your_probability": t.get("your_probability"),
@@ -210,8 +211,8 @@ async def open_positions():
     return result
 
 
-@app.get("/api/positions/history")
-async def trade_history(limit: int = 100):
+def _build_closed_positions(limit: int = 200) -> list[dict]:
+    """Resolved trades with REALISED P&L (actual win/loss)."""
     trades = _load_resolved_trades()
     trades.sort(key=lambda t: t.get("ts") or "", reverse=True)
     trades = trades[:limit]
@@ -219,7 +220,7 @@ async def trade_history(limit: int = 100):
     result = []
     for t in trades:
         usdc_size = float(t.get("usdc_size", 0))
-        pnl = float(t.get("pnl", 0))
+        pnl = float(t.get("pnl", 0))           # actual realised P&L
         pnl_pct = (pnl / usdc_size * 100) if usdc_size else 0
 
         result.append({
@@ -228,8 +229,10 @@ async def trade_history(limit: int = 100):
             "outcome_traded": t.get("outcome_traded"),
             "price_paid": t.get("price_paid"),
             "usdc_size": round(usdc_size, 2),
+            # Realised P&L — position closed/resolved
             "pnl_usd": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
+            "pnl_type": "realised",
             "won": t.get("won"),
             "market_resolved_yes": t.get("market_resolved_yes"),
             "date_opened": t.get("ts"),
@@ -241,11 +244,60 @@ async def trade_history(limit: int = 100):
     return result
 
 
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.add(websocket)
+    log.info(f"WebSocket client connected ({len(connected_clients)} total)")
+
+    try:
+        summary = await _build_summary()
+        positions = await _build_open_positions()
+        await websocket.send_text(json.dumps({
+            "event": "init",
+            "data": {"summary": summary, "positions": positions}
+        }))
+
+        while True:
+            await asyncio.sleep(30)
+            positions = await _build_open_positions()
+            summary = await _build_summary()
+            await websocket.send_text(json.dumps({
+                "event": "update",
+                "data": {"summary": summary, "positions": positions}
+            }))
+
+    except WebSocketDisconnect:
+        connected_clients.discard(websocket)
+        log.info(f"WebSocket client disconnected ({len(connected_clients)} remaining)")
+    except Exception as e:
+        connected_clients.discard(websocket)
+        log.warning(f"WebSocket error: {e}")
+
+
+# ── REST endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/api/summary")
+async def summary():
+    return await _build_summary()
+
+
+@app.get("/api/positions/open")
+async def open_positions():
+    return await _build_open_positions()
+
+
+@app.get("/api/positions/history")
+async def trade_history(limit: int = 200):
+    return _build_closed_positions(limit)
+
+
 @app.get("/api/pnl/curve")
 async def pnl_curve():
     trades = _load_resolved_trades()
     trades.sort(key=lambda t: t.get("ts") or "")
-
     cumulative = 0.0
     points = []
     for t in trades:
@@ -257,7 +309,6 @@ async def pnl_curve():
             "question": (t.get("question") or "")[:50],
             "won": t.get("won"),
         })
-
     return points
 
 
@@ -278,6 +329,7 @@ async def debug():
         "open_trades_lines": sum(1 for _ in open(OPEN_TRADES_PATH)) if os.path.exists(OPEN_TRADES_PATH) else 0,
         "wallet_address": os.getenv("WALLET_ADDRESS", "not set"),
         "wallet_balance_usd": round(balance, 2) if balance is not None else None,
+        "ws_clients": len(connected_clients),
         "logs_dir": os.listdir("logs") if os.path.exists("logs") else "missing",
     }
 

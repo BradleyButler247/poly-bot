@@ -29,6 +29,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
+INTER_MARKET_DELAY = int(os.getenv("INTER_MARKET_DELAY", "3"))
+
+
+async def _notify(event: str, data: dict):
+    try:
+        from .api_server import broadcast
+        await broadcast(event, data)
+    except Exception:
+        pass
+
 
 class PolymarketBot:
     def __init__(self):
@@ -73,25 +83,25 @@ class PolymarketBot:
             log.warning("Daily loss limit hit — skipping")
             return
 
-        # Check if any open trades have resolved → feeds the learning loop
         await self.resolver.check_resolutions()
-
-        # Every 10 cycles: Claude reviews its own performance and updates strategy notes
         await self.analyst.maybe_update_strategy()
 
-        # Fetch and evaluate markets
         markets = await self.fetcher.get_candidate_markets()
         log.info(f"Evaluating {len(markets)} markets")
+        await _notify("cycle_start", {"cycle_id": cycle_id, "market_count": len(markets)})
 
-        for market in markets:
+        for i, market in enumerate(markets):
             if not self._running:
                 break
             try:
                 await self._evaluate_market(market, cycle_id)
             except Exception as e:
                 log.error(f"Error on market {market.get('id')}: {e}")
-            # Small pause between markets to avoid rate limits
-            await asyncio.sleep(2)
+
+            if i < len(markets) - 1 and self._running:
+                await asyncio.sleep(INTER_MARKET_DELAY)
+
+        await _notify("cycle_end", {"cycle_id": cycle_id})
 
     async def _evaluate_market(self, market: dict, cycle_id: str):
         market_id = market["id"]
@@ -123,7 +133,15 @@ class PolymarketBot:
         result = await self.trader.place_order(market, trade)
         self.audit.log_trade(cycle_id, market_id, question, trade, result, analysis)
 
-        # Register for resolution tracking so we can learn from this trade
+        await _notify("trade", {
+            "question": question,
+            "outcome": trade["outcome"],
+            "price": trade["price"],
+            "usdc_size": trade["usdc_size"],
+            "success": result.get("success"),
+            "order_id": result.get("order_id"),
+        })
+
         if result.get("success"):
             self.resolver.record_open_trade(
                 market_id=market_id,
