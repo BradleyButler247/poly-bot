@@ -62,30 +62,29 @@ class Trader:
     async def place_order(self, market: dict, trade: dict) -> dict[str, Any]:
         """
         Place a limit order on Polymarket.
-        Returns the order result dict.
         """
-        token_id = self._get_token_id(market, trade["outcome"])
+        token_id = await self._get_token_id(market, trade["outcome"])
         if not token_id:
-            log.error(f"Could not find token_id for {trade['outcome']} in market {market.get('id')}. Tokens: {market.get('tokens')}")
+            log.error(f"Could not find token_id for {trade['outcome']} in market {market.get('id')}. conditionId={market.get('conditionId')} tokens={market.get('tokens')}")
             return {"success": False, "error": "Could not find token_id for outcome"}
 
         price = float(trade["price"])
         size = float(trade["usdc_size"])
         shares = round(size / price, 2)
 
-        log.info(f"Placing order: {trade['outcome']} {shares} shares @ {price} (${size} USDC) market={market.get('id')}")
+        log.info(f"Placing order: {trade['outcome']} {shares} shares @ {price} (${size} USDC) token={token_id[:16]}...")
 
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=shares,
-            side="BUY",  # We always buy the outcome we believe in
+            side="BUY",
         )
 
         try:
-            log.info(f"Signing order: {trade['outcome']} {shares} shares @ {price} token_id={token_id[:16]}...")
+            log.info(f"Signing order...")
             signed_order = self._client.create_and_sign_order(order_args)
-            log.info(f"Order signed, submitting to CLOB...")
+            log.info(f"Submitting to CLOB...")
             resp = self._client.post_order(signed_order, OrderType.GTC)
             log.info(f"CLOB response: {resp}")
 
@@ -113,37 +112,68 @@ class Trader:
             log.error(f"Order exception: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    async def get_open_orders(self) -> list[dict]:
-        """Fetch all open orders for this account."""
-        try:
-            return self._client.get_orders() or []
-        except Exception as e:
-            log.error(f"Failed to fetch open orders: {e}")
-            return []
+    async def _get_token_id(self, market: dict, outcome: str) -> str | None:
+        """
+        Get the CLOB token ID for a given outcome.
+        Tries multiple sources in order:
+        1. tokens list from Gamma API (token_id or tokenId field)
+        2. clobTokenIds field from Gamma API
+        3. Fetch directly from CLOB using conditionId
+        """
+        outcome_upper = outcome.upper()
 
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel a specific order."""
-        try:
-            resp = self._client.cancel(order_id)
-            cancelled = resp.get("canceled", [])
-            return order_id in cancelled
-        except Exception as e:
-            log.error(f"Failed to cancel order {order_id}: {e}")
-            return False
-
-    async def cancel_all_orders(self):
-        """Emergency: cancel all open orders."""
-        log.warning("Cancelling ALL open orders")
-        try:
-            self._client.cancel_all()
-            log.info("All orders cancelled")
-        except Exception as e:
-            log.error(f"Cancel-all failed: {e}")
-
-    def _get_token_id(self, market: dict, outcome: str) -> str | None:
-        """Extract the CLOB token ID for a given outcome (YES or NO)."""
+        # Source 1: tokens list
         tokens = market.get("tokens") or []
+        if isinstance(tokens, str):
+            import json as _json
+            try:
+                tokens = _json.loads(tokens)
+            except Exception:
+                tokens = []
+
         for token in tokens:
-            if str(token.get("outcome", "")).upper() == outcome.upper():
-                return token.get("token_id") or token.get("tokenId")
+            if str(token.get("outcome", "")).upper() == outcome_upper:
+                tid = token.get("token_id") or token.get("tokenId") or token.get("id")
+                if tid:
+                    log.info(f"Found token_id from tokens list: {tid[:16]}...")
+                    return tid
+
+        # Source 2: clobTokenIds (Gamma sometimes stores YES/NO ids here)
+        clob_ids = market.get("clobTokenIds")
+        if clob_ids:
+            if isinstance(clob_ids, str):
+                import json as _json
+                try:
+                    clob_ids = _json.loads(clob_ids)
+                except Exception:
+                    clob_ids = []
+            if isinstance(clob_ids, list):
+                # Convention: index 0 = YES, index 1 = NO
+                idx = 0 if outcome_upper == "YES" else 1
+                if len(clob_ids) > idx and clob_ids[idx]:
+                    log.info(f"Found token_id from clobTokenIds: {str(clob_ids[idx])[:16]}...")
+                    return str(clob_ids[idx])
+
+        # Source 3: Fetch from CLOB using conditionId
+        condition_id = market.get("conditionId") or market.get("condition_id")
+        if condition_id:
+            try:
+                import aiohttp
+                url = f"{self.config.clob_host}/markets/{condition_id}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            tokens = data.get("tokens") or []
+                            for token in tokens:
+                                if str(token.get("outcome", "")).upper() == outcome_upper:
+                                    tid = token.get("token_id") or token.get("tokenId")
+                                    if tid:
+                                        log.info(f"Found token_id from CLOB API: {tid[:16]}...")
+                                        return tid
+            except Exception as e:
+                log.warning(f"CLOB token lookup failed: {e}")
+
+        log.error(f"Could not find token_id for {outcome} in market {market.get('id')}. "
+                  f"conditionId={condition_id}, clobTokenIds={clob_ids}, tokens={tokens}")
         return None
