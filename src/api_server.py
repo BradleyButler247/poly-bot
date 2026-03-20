@@ -86,42 +86,46 @@ async def _fetch_current_price(market_id: str) -> Optional[float]:
 
 
 async def _fetch_wallet_balance(wallet_address: str) -> Optional[float]:
-    """Fetch USDC balance from Polymarket CLOB API."""
+    """
+    Fetch USDC.e balance from Polymarket CLOB API.
+    Per docs: GET /balance-allowance with signature_type=1 (POLY_PROXY)
+    and the proxy wallet address as poly-address header.
+    Falls back to direct Polygon RPC call against USDC.e contract
+    (0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174) per contract addresses docs.
+    """
+    # Primary: Polymarket CLOB balance endpoint
     try:
         url = f"{CLOB_HOST}/balance-allowance"
-        params = {"asset_type": "USDC", "signature_type": 0}
+        params = {"asset_type": "USDC", "signature_type": 1}
         headers = {"poly-address": wallet_address}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    balance = data.get("balance") or data.get("allowance") or 0
-                    return float(balance) / 1e6  # USDC has 6 decimals
+                    log.debug(f"Balance response: {data}")
+                    balance = float(data.get("balance", 0) or 0)
+                    return balance / 1e6  # USDC.e has 6 decimals
     except Exception as e:
-        log.warning(f"Balance fetch failed: {e}")
+        log.warning(f"CLOB balance fetch failed: {e}")
 
-    # Fallback: try both USDC contracts on Polygon
-    contracts = [
-        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Native USDC
-        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e bridged
-    ]
+    # Fallback: direct Polygon RPC call against USDC.e contract
+    # Per docs contract address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+    USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     RPC = "https://polygon-rpc.com"
-    total = 0.0
     addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
-    for contract in contracts:
-        data = "0x70a08231" + addr_padded
-        payload = {"jsonrpc": "2.0", "method": "eth_call",
-                   "params": [{"to": contract, "data": data}, "latest"], "id": 1}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(RPC, json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    result = await resp.json()
-            total += int(result.get("result", "0x0"), 16) / 1e6
-        except Exception:
-            pass
-    return total
+    data = "0x70a08231" + addr_padded
+    payload = {"jsonrpc": "2.0", "method": "eth_call",
+               "params": [{"to": USDC_E, "data": data}, "latest"], "id": 1}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(RPC, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                result = await resp.json()
+        return int(result.get("result", "0x0"), 16) / 1e6
+    except Exception as e:
+        log.warning(f"RPC balance fetch failed: {e}")
+        return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -137,8 +141,8 @@ async def summary():
     total = len(resolved)
     open_volume = sum(t.get("usdc_size", 0) for t in open_trades)
 
-    # Fetch live wallet balance
-    wallet_address = os.getenv("WALLET_ADDRESS", "")
+    # Fetch live USDC.e balance from proxy wallet (profile address per docs)
+    wallet_address = os.getenv("WALLET_ADDRESS", "")  # must be proxy address 0x1ed8...
     balance = None
     if wallet_address:
         balance = await _fetch_wallet_balance(wallet_address)

@@ -38,8 +38,8 @@ class Trader:
             host=self.config.clob_host,
             chain_id=POLYGON,
             key=self.config.wallet_private_key,
-            signature_type=0,  # EOA for embedded wallet
-            funder=wallet_address if wallet_address else self.config.wallet_private_key,
+            signature_type=1,  # POLY_PROXY — correct for email/browser embedded wallets
+            funder=wallet_address,  # proxy wallet address shown on your Polymarket profile
         )
 
         try:

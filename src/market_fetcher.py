@@ -1,9 +1,14 @@
 """
-Market Fetcher — pulls open markets from Polymarket's Gamma API
-and filters them down to tradeable candidates.
+Market Fetcher — pulls markets from Polymarket's Gamma API.
+
+Per official docs, the events endpoint is most efficient for market discovery.
+Events contain their associated markets, reducing API calls.
+Markets are scored by a combination of liquidity and proximity to resolution.
 """
 
+import json as _json
 import logging
+import datetime
 import aiohttp
 from typing import Any
 
@@ -29,23 +34,20 @@ class MarketFetcher:
             else:
                 filter_counts[reason] = filter_counts.get(reason, 0) + 1
 
-        log.info(f"Pre-filter results: {len(candidates)} passed, filtered out → {filter_counts}")
+        log.info(f"Pre-filter: {len(candidates)} passed, filtered → {filter_counts}")
 
-        # Score markets: prefer higher liquidity AND closer resolution date
-        import datetime
         now = datetime.datetime.now(datetime.timezone.utc)
 
         def score(m):
             liquidity = float(m.get("liquidity") or 0)
             end_date = m.get("endDate") or m.get("end_date_iso")
-            days_left = 365  # default if unknown
+            days_left = 365
             if end_date:
                 try:
                     closes = datetime.datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                     days_left = max(1, (closes - now).total_seconds() / 86400)
                 except Exception:
                     pass
-            # Favour markets resolving within 30 days and with good liquidity
             recency_bonus = max(0, (30 - days_left) / 30) * 5000
             return liquidity + recency_bonus
 
@@ -53,6 +55,43 @@ class MarketFetcher:
         return candidates[: self.config.max_markets_per_cycle]
 
     async def _fetch_active_markets(self) -> list[dict]:
+        """
+        Use events endpoint per official docs — events contain their markets.
+        Fall back to markets endpoint if needed.
+        """
+        url = f"{self.config.gamma_host}/events"
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": 100,
+            "order": "liquidity",
+            "ascending": "false",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    events = await resp.json()
+
+            markets = []
+            for event in (events if isinstance(events, list) else []):
+                for market in (event.get("markets") or []):
+                    if not market.get("liquidity") and event.get("liquidity"):
+                        market["liquidity"] = event["liquidity"]
+                    markets.append(market)
+
+            if markets:
+                return markets
+
+            log.warning("Events endpoint returned no markets, falling back to /markets")
+        except Exception as e:
+            log.error(f"Events endpoint failed: {e}, falling back to /markets")
+
+        return await self._fetch_markets_fallback()
+
+    async def _fetch_markets_fallback(self) -> list[dict]:
+        url = f"{self.config.gamma_host}/markets"
         params = {
             "active": "true",
             "closed": "false",
@@ -60,32 +99,23 @@ class MarketFetcher:
             "order": "liquidity",
             "ascending": "false",
         }
-        if self.config.market_categories:
-            params["tag"] = self.config.market_categories[0]
-
-        url = f"{self.config.gamma_host}/markets"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
-            if isinstance(data, list):
-                return data
-            return data.get("markets", [])
+            return data if isinstance(data, list) else data.get("markets", [])
         except Exception as e:
-            log.error(f"Failed to fetch markets from Gamma API: {e}")
+            log.error(f"Fallback markets fetch failed: {e}")
             return []
 
     def _passes_prefilter(self, market: dict) -> tuple[bool, str]:
-        import datetime
-        import json as _json
-
         # Liquidity check
         liquidity = float(market.get("liquidity") or 0)
         if liquidity < self.config.min_liquidity_usdc:
             return False, "liquidity"
 
-        # Binary market check — outcomes field can be a JSON string or a list
+        # Binary market — outcomes must be exactly 2
         outcomes_raw = market.get("outcomes", [])
         if isinstance(outcomes_raw, str):
             try:
@@ -94,6 +124,30 @@ class MarketFetcher:
                 outcomes_raw = []
         if len(outcomes_raw) != 2:
             return False, "outcomes"
+
+        # Must have clobTokenIds for order placement
+        clob_ids = market.get("clobTokenIds")
+        if isinstance(clob_ids, str):
+            try:
+                clob_ids = _json.loads(clob_ids)
+            except Exception:
+                clob_ids = []
+        tokens = market.get("tokens") or []
+        if isinstance(tokens, str):
+            try:
+                tokens = _json.loads(tokens)
+            except Exception:
+                tokens = []
+        has_token_ids = (isinstance(clob_ids, list) and len(clob_ids) >= 2) or bool(tokens)
+        if not has_token_ids:
+            return False, "no_token_ids"
+
+        # Skip near-resolved markets (YES price > 0.95 or < 0.05)
+        for token in tokens:
+            if str(token.get("outcome", "")).upper() == "YES":
+                price = float(token.get("price") or 0.5)
+                if price > 0.95 or price < 0.05:
+                    return False, "near_resolved"
 
         # Skip markets resolving in < 1 hour
         end_date = market.get("endDate") or market.get("end_date_iso")
@@ -112,18 +166,9 @@ class MarketFetcher:
             if not any(cat.lower() in tags for cat in self.config.market_categories):
                 return False, "category"
 
-        # Skip near-resolved markets (price > 0.95 or < 0.05 on either side)
-        tokens = market.get("tokens") or []
-        for token in tokens:
-            if str(token.get("outcome", "")).upper() == "YES":
-                price = float(token.get("price") or 0.5)
-                if price > 0.95 or price < 0.05:
-                    return False, "liquidity"  # reuse liquidity bucket for near-resolved
-
         return True, "ok"
 
     async def get_market_orderbook(self, token_id: str) -> dict[str, Any]:
-        """Fetch the live order book for a specific outcome token."""
         url = f"{self.config.clob_host}/book"
         params = {"token_id": token_id}
         async with aiohttp.ClientSession() as session:
