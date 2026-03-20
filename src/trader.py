@@ -1,14 +1,12 @@
 """
-Trader — executes orders on Polymarket using the py-clob-client SDK.
-
-Polymarket uses a Central Limit Order Book (CLOB) on Polygon.
-Orders are signed with your wallet's private key.
+Trader — executes orders on Polymarket via py-clob-client.
 """
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
+import aiohttp
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.constants import POLYGON
@@ -28,23 +26,15 @@ class Trader:
         self._client = self._build_client()
 
     def _build_client(self) -> ClobClient:
-        """
-        Initialise the Polymarket CLOB client.
-        Derives API credentials directly from the wallet private key
-        to ensure they match — manual key entry often causes silent auth failures.
-        """
         wallet_address = os.getenv("WALLET_ADDRESS", "")
         client = ClobClient(
             host=self.config.clob_host,
             chain_id=POLYGON,
             key=self.config.wallet_private_key,
-            signature_type=1,  # POLY_PROXY — correct for email/browser embedded wallets
-            funder=wallet_address,  # proxy wallet address shown on your Polymarket profile
+            signature_type=1,
+            funder=wallet_address,
         )
-
         try:
-            # Try to derive credentials from the private key directly
-            # This is more reliable than manually entered API keys
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
             log.info(f"CLOB client initialised (derived creds, key: {creds.api_key[:8]}...)")
@@ -58,32 +48,82 @@ class Trader:
             )
             client.set_api_creds(creds)
             log.info("CLOB client initialised (env var creds)")
-
         return client
 
+    async def fetch_balance(self) -> Optional[float]:
+        """
+        Fetch live USDC balance from Polygon blockchain.
+        Called once per cycle to cap trade sizes to available funds.
+        Tries multiple RPC endpoints with CLOB as fallback.
+        """
+        wallet_address = os.getenv("WALLET_ADDRESS", "")
+        if not wallet_address:
+            return None
+
+        USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        RPC_ENDPOINTS = [
+            "https://polygon-rpc.com",
+            "https://rpc-mainnet.matic.network",
+            "https://rpc.ankr.com/polygon",
+        ]
+
+        addr_padded = wallet_address.replace("0x", "").lower().zfill(64)
+        call_data = "0x70a08231" + addr_padded
+        payload = {
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{"to": USDC_E, "data": call_data}, "latest"], "id": 1,
+        }
+
+        for rpc in RPC_ENDPOINTS:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(rpc, json=payload,
+                                            timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        result = await resp.json()
+                hex_val = result.get("result", "0x0")
+                if hex_val and hex_val != "0x":
+                    raw = int(hex_val, 16)
+                    balance = raw / 1e6
+                    if balance > 0:
+                        log.debug(f"Balance from {rpc}: ${balance:.2f}")
+                        return balance
+            except Exception:
+                continue
+
+        # Fallback: CLOB balance endpoint
+        try:
+            url = f"{self.config.clob_host}/balance-allowance"
+            params = {"asset_type": "USDC", "signature_type": 1}
+            headers = {"poly-address": wallet_address}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        balance = float(data.get("balance", 0) or 0)
+                        result = balance / 1e6
+                        if result > 0:
+                            return result
+        except Exception as e:
+            log.warning(f"CLOB balance fetch failed: {e}")
+
+        return None
+
     async def place_order(self, market: dict, trade: dict) -> dict[str, Any]:
-        """
-        Place a limit order on Polymarket.
-        """
         token_id = await self._get_token_id(market, trade["outcome"])
         if not token_id:
-            log.error(f"Could not find token_id for {trade['outcome']} in market {market.get('id')}. conditionId={market.get('conditionId')} tokens={market.get('tokens')}")
+            log.error(f"Could not find token_id for {trade['outcome']} in market {market.get('id')}")
             return {"success": False, "error": "Could not find token_id for outcome"}
 
-        # Verify orderbook exists before attempting to place order
         if not await self._check_orderbook_exists(token_id):
             log.warning(f"No orderbook for token {token_id[:16]}... — skipping")
             return {"success": False, "error": "orderbook does not exist"}
 
         price = float(trade["price"])
-        outcome = trade["outcome"]
-
-        # When buying NO, the correct limit price is 1 - YES_price.
-        # Claude sometimes sets price=1.0 for near-certain NO trades which
-        # the CLOB rejects (valid range: 0.001 - 0.999).
-        # Clamp to valid range and round to nearest tick (0.01 default).
-        price = max(0.001, min(0.999, price))
-        # Round to 3 decimal places (standard tick size)
+        # Clamp to valid CLOB range.
+        # Upper bound is 0.99: Polymarket redeems winning shares at $1.00,
+        # so buying at $0.99 still yields ~1% profit at resolution.
+        price = max(0.001, min(0.99, price))
         price = round(price, 3)
 
         size = float(trade["usdc_size"])
@@ -128,16 +168,7 @@ class Trader:
             return {"success": False, "error": str(e)}
 
     async def _get_token_id(self, market: dict, outcome: str) -> str | None:
-        """
-        Get the CLOB token ID for a given outcome.
-        Tries multiple sources in order:
-        1. tokens list from Gamma API (token_id or tokenId field)
-        2. clobTokenIds field from Gamma API
-        3. Fetch directly from CLOB using conditionId
-        """
         outcome_upper = outcome.upper()
-
-        # Source 1: tokens list
         tokens = market.get("tokens") or []
         if isinstance(tokens, str):
             import json as _json
@@ -153,7 +184,6 @@ class Trader:
                     log.info(f"Found token_id from tokens list: {tid[:16]}...")
                     return tid
 
-        # Source 2: clobTokenIds (Gamma sometimes stores YES/NO ids here)
         clob_ids = market.get("clobTokenIds")
         if clob_ids:
             if isinstance(clob_ids, str):
@@ -163,24 +193,20 @@ class Trader:
                 except Exception:
                     clob_ids = []
             if isinstance(clob_ids, list):
-                # Convention: index 0 = YES, index 1 = NO
                 idx = 0 if outcome_upper == "YES" else 1
                 if len(clob_ids) > idx and clob_ids[idx]:
                     log.info(f"Found token_id from clobTokenIds: {str(clob_ids[idx])[:16]}...")
                     return str(clob_ids[idx])
 
-        # Source 3: Fetch from CLOB using conditionId
         condition_id = market.get("conditionId") or market.get("condition_id")
         if condition_id:
             try:
-                import aiohttp
                 url = f"{self.config.clob_host}/markets/{condition_id}"
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            tokens = data.get("tokens") or []
-                            for token in tokens:
+                            for token in (data.get("tokens") or []):
                                 if str(token.get("outcome", "")).upper() == outcome_upper:
                                     tid = token.get("token_id") or token.get("tokenId")
                                     if tid:
@@ -189,14 +215,11 @@ class Trader:
             except Exception as e:
                 log.warning(f"CLOB token lookup failed: {e}")
 
-        log.error(f"Could not find token_id for {outcome} in market {market.get('id')}. "
-                  f"conditionId={condition_id}, clobTokenIds={clob_ids}, tokens={tokens}")
+        log.error(f"Could not find token_id for {outcome} in market {market.get('id')}")
         return None
 
     async def _check_orderbook_exists(self, token_id: str) -> bool:
-        """Verify the CLOB has an active orderbook for this token before placing an order."""
         try:
-            import aiohttp
             url = f"{self.config.clob_host}/book"
             params = {"token_id": token_id}
             async with aiohttp.ClientSession() as session:
