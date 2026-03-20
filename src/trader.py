@@ -9,7 +9,7 @@ import logging
 from typing import Any
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
+from py_clob_client.clob_types import OrderArgs
 from py_clob_client.constants import POLYGON
 
 from .config import Config
@@ -82,10 +82,8 @@ class Trader:
         )
 
         try:
-            log.info(f"Signing order...")
-            signed_order = self._client.create_and_sign_order(order_args)
-            log.info(f"Submitting to CLOB...")
-            resp = self._client.post_order(signed_order, OrderType.GTC)
+            log.info(f"Signing and submitting order...")
+            resp = self._client.create_and_post_order(order_args)
             log.info(f"CLOB response: {resp}")
 
             success = resp.get("success", False) or resp.get("orderID") is not None
