@@ -6,6 +6,7 @@ Orders are signed with your wallet's private key.
 """
 
 import logging
+import os
 from typing import Any
 
 from py_clob_client.client import ClobClient
@@ -32,12 +33,13 @@ class Trader:
         Derives API credentials directly from the wallet private key
         to ensure they match — manual key entry often causes silent auth failures.
         """
+        wallet_address = os.getenv("WALLET_ADDRESS", "")
         client = ClobClient(
             host=self.config.clob_host,
             chain_id=POLYGON,
             key=self.config.wallet_private_key,
-            signature_type=0,  # EOA — correct for Polymarket embedded wallets
-            funder=self.config.wallet_private_key,
+            signature_type=0,  # EOA for embedded wallet
+            funder=wallet_address if wallet_address else self.config.wallet_private_key,
         )
 
         try:
